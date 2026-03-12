@@ -1,228 +1,12 @@
 # @dymoo/media-understanding
 
-Turn audio, video, and images into the two modalities LLMs actually accept well: text and images.
+Turn audio, video, and images into the two modalities LLMs actually accept: **text** and **images**.
 
-| Input                     | Output                                             |
-| ------------------------- | -------------------------------------------------- |
-| Audio (mp3, wav, m4a, …)  | Transcript text                                    |
-| Video (mp4, mkv, mov, …)  | Transcript text + timestamped overview/grid images |
-| Image (png, jpg, webp, …) | Compressed JPEG (base64) + metadata                |
-
-## Quick Start
-
-```bash
-npm install @dymoo/media-understanding
-```
-
-Requirements:
-
-- Node >= 20
-- FFmpeg is handled via `node-av`
-- the default Whisper model (`base.en-q5_1`) is pre-warmed on install unless you set `SKIP_MODEL_DOWNLOAD=1`
-
-First useful call for a single video:
-
-```json
-{
-  "file_path": "/path/to/video.mp4",
-  "max_total_chars": 32000
-}
-```
-
-That returns:
-
-- metadata
-- transcript text
-- timestamped video overview images
-- a strict payload cap so an LLM does not accidentally explode context
-
-## How It Works
-
-The package is designed for conservative agent usage:
-
-1. inspect a single file, or a very small batch
-2. get a compact first-pass understanding
-3. zoom in only when needed with transcript-only, grid-only, or exact-frame calls
-
-![How media-understanding works](docs/assets/how-it-works.svg)
-
-### What the model sees
-
-#### Video overview
-
-Each returned grid tile carries an exact timestamp overlay so the model can ask for precise follow-up frames.
-
-![Timestamped video overview example](docs/assets/visual-output-example.svg)
-
-#### Transcript output
-
-Transcript-first flows stay lightweight and timestamped.
-
-![Transcript example](docs/assets/transcript-example.svg)
-
-### Example MCP flow
-
-Single short video:
-
-```json
-{
-  "tool": "understand_media",
-  "arguments": {
-    "file_path": "/path/to/video.mp4",
-    "max_total_chars": 32000
-  }
-}
-```
-
-Typical response shape:
-
-```text
-File: /path/to/video.mp4
-Type: video
-Duration: 58.3s
-Resolution: 1920x1080
-Video sampling: 1 grid image(s), each tile has an exact timestamp overlay.
-
---- TRANSCRIPT ---
-We open on a hallway...
-
---- FRAME GRID 1/1 ---
-Grid 1/1 covers 0.000s-24.000s. Tile timestamps: 00:00:03.000, 00:00:06.000, ...
-
-Payload: 28741 chars total, 23180 base64 image chars.
-```
-
-Long video, spoken-content first:
-
-```json
-{
-  "tool": "get_transcript",
-  "arguments": {
-    "file_path": "/path/to/podcast.mp3",
-    "max_chars": 16000
-  }
-}
-```
-
-Then narrow back to visuals if needed:
-
-```json
-{
-  "tool": "get_video_grids",
-  "arguments": {
-    "file_path": "/path/to/video.mp4",
-    "start_sec": 300,
-    "end_sec": 420,
-    "seconds_per_frame": 8,
-    "max_total_chars": 32000
-  }
-}
-```
-
-Need an exact moment?
-
-```json
-{
-  "tool": "get_frames",
-  "arguments": {
-    "file_path": "/path/to/video.mp4",
-    "timestamps": [83.5],
-    "max_total_chars": 32000
-  }
-}
-```
-
-## Recommended LLM Workflow
-
-Keep it conservative.
-
-### Single file
-
-- image -> `understand_media`
-- audio -> `get_transcript` first if timestamps matter, otherwise `understand_media`
-- short/medium video -> `understand_media`
-- long video -> `get_transcript` first when speech matters most, otherwise `get_video_grids`
-
-### Small batch
-
-Use `understand_media` with either `file_paths` or a narrow `glob`, but only for a very small shortlist pass.
-
-```json
-{
-  "file_paths": ["clip.mp4", "episode.mp3"],
-  "max_files": 2,
-  "batch_concurrency": 2,
-  "max_total_chars": 32000
-}
-```
-
-Why the API is strict:
-
-- broad batches get rejected on purpose
-- concurrency is clamped low on purpose
-- payloads are capped on purpose
-
-This prevents a model from bulk-loading huge media sets and blowing up memory or context.
-
-## MCP Tools
-
-### `understand_media`
-
-First-pass tool for a single file or a tiny conservative batch.
-
-Supports exactly one of:
-
-- `file_path`
-- `file_paths`
-- `glob`
-
-Useful options:
-
-- `max_total_chars`
-- `max_chars`
-- `max_grids`
-- `seconds_per_frame`
-- `seconds_per_grid`
-- `sampling_strategy`
-- `aspect_mode`
-- `max_files`
-- `batch_concurrency`
-
-Examples:
-
-```json
-{ "file_path": "/path/to/video.mp4" }
-{ "file_paths": ["clip.mp4", "podcast.mp3"] }
-{ "glob": "media/*.{mp4,png}", "max_files": 2 }
-{ "file_path": "/path/to/clip.mp4", "start_sec": 60, "end_sec": 120, "max_grids": 2, "seconds_per_frame": 6, "seconds_per_grid": 30 }
-```
-
-### `get_video_grids`
-
-Visual-only drill-down for videos. Every tile has an exact timestamp overlay and the response text lists tile timestamps.
-
-```json
-{ "file_path": "/path/to/movie.mkv", "max_grids": 2, "seconds_per_frame": 8 }
-{ "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }
-```
-
-### `get_frames`
-
-Exact frames for exact timestamps.
-
-```json
-{ "file_path": "/path/to/video.mp4", "timestamps": [0, 30, 60] }
-{ "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }
-```
-
-### `get_transcript`
-
-Timestamped transcript text only.
-
-```json
-{ "file_path": "/path/to/podcast.mp3" }
-{ "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }
-```
+| Input                       | Output                                             |
+| --------------------------- | -------------------------------------------------- |
+| Audio (mp3, wav, m4a, ...)  | Timestamped transcript text                        |
+| Video (mp4, mkv, mov, ...)  | Transcript text + timestamped keyframe grid images |
+| Image (png, jpg, webp, ...) | Compressed JPEG (base64) + metadata                |
 
 ## Agent Setup
 
@@ -251,7 +35,7 @@ Add to `~/.config/opencode/opencode.json`:
 <details>
 <summary>Claude Desktop</summary>
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or `%APPDATA%\Claude\claude_desktop_config.json` on Windows:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -322,6 +106,169 @@ Add a new MCP server:
 
 </details>
 
+## Quick Start
+
+```bash
+npm install @dymoo/media-understanding
+```
+
+Requirements:
+
+- Node >= 20
+- FFmpeg is handled automatically via `node-av`
+- The default Whisper model (`base.en-q5_1`, ~57 MB) downloads on first use; set `SKIP_MODEL_DOWNLOAD=1` to defer
+
+## How It Works
+
+The server exposes five tools organized around a three-step workflow: **discover, analyze, iterate**.
+
+```
+Step 1: DISCOVER (cheap, batch-safe)
+  probe_media  →  metadata for 1-200 files (~5-50ms each, header reads only)
+
+Step 2: ANALYZE (expensive, one file at a time)
+  understand_media  →  full analysis: metadata + transcript + keyframe grids
+  get_transcript    →  timestamped speech text
+  get_video_grids   →  visual keyframe contact sheets
+  get_frames        →  exact frames at specific timestamps
+
+Step 3: ITERATE (use output from one tool to target another)
+  transcript timestamps → get_video_grids with start_sec/end_sec
+  grid timestamps → get_frames with exact seconds
+```
+
+The cost boundary between cheap and expensive operations is encoded in the tool names. `probe_media` is safe to call on dozens of files. The analysis tools process one file per call and enforce payload budgets so an LLM does not accidentally blow up its context.
+
+## MCP Tools
+
+### `probe_media` — discover and triage
+
+Scan files for metadata before committing to heavy analysis. Returns type, duration, resolution, codecs, file size. No decoding, no transcription, no images.
+
+Accepts exactly one of `file_path`, `file_paths`, or `glob`. Default limit: 50 files (max 200).
+
+```json
+{ "file_path": "/path/to/video.mp4" }
+{ "file_paths": ["/path/to/a.mp4", "/path/to/b.mp3"] }
+{ "glob": "media/**/*.{mp4,mp3,wav}" }
+{ "glob": "recordings/*.mp4", "max_files": 100 }
+```
+
+### `understand_media` — full single-file analysis
+
+Returns metadata + transcript + keyframe grids for one file. Best for images, short audio, and short-to-medium video. For files over 2 hours, use the focused tools below instead.
+
+```json
+{ "file_path": "/path/to/video.mp4" }
+{ "file_path": "/path/to/podcast.mp3", "model": "base.en" }
+{ "file_path": "/path/to/clip.mp4", "start_sec": 60, "end_sec": 120, "max_grids": 3 }
+```
+
+Key options: `model`, `max_chars`, `max_total_chars`, `max_grids`, `start_sec`, `end_sec`, `sampling_strategy`, `seconds_per_frame`, `seconds_per_grid`, `cols`, `rows`, `thumb_width`, `aspect_mode`.
+
+### `get_transcript` — speech content only
+
+Timestamped transcript text. Supports files up to 4 hours. Each line includes `[start-end]` timestamps.
+
+```json
+{ "file_path": "/path/to/podcast.mp3" }
+{ "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }
+```
+
+### `get_video_grids` — visual keyframe sampling
+
+JPEG contact sheets of thumbnails. Every tile has an exact timestamp overlay. Budget-aware: omit `max_grids` and the server auto-fits as many grids as possible within `max_total_chars`.
+
+```json
+{ "file_path": "/path/to/video.mp4" }
+{ "file_path": "/path/to/movie.mkv", "start_sec": 300, "end_sec": 600, "max_grids": 2, "seconds_per_frame": 8 }
+{ "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }
+```
+
+### `get_frames` — exact moments
+
+One JPEG per requested timestamp. Each frame includes a timestamp overlay.
+
+```json
+{ "file_path": "/path/to/video.mp4", "timestamps": [0, 30, 60] }
+{ "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }
+```
+
+## Recommended LLM Workflow
+
+### Per-file type guidance
+
+| Media type         | Recommended first tool                                              |
+| ------------------ | ------------------------------------------------------------------- |
+| Image              | `understand_media`                                                  |
+| Short audio (<30m) | `understand_media`                                                  |
+| Long audio         | `get_transcript`                                                    |
+| Short video (<10m) | `understand_media`                                                  |
+| Long video         | `get_transcript` (speech-first) or `get_video_grids` (visual-first) |
+
+### Iteration pattern
+
+1. Start with `understand_media` or `get_transcript` for a first-pass understanding
+2. Use transcript timestamps to target `get_video_grids` on a narrow window
+3. Use grid timestamps to target `get_frames` for exact moments
+
+Narrow the window — don't widen it. Each follow-up call should be more targeted than the last.
+
+## Processing Multiple Files
+
+For a single file, call `understand_media` directly. For multiple files, follow the three-tier workflow.
+
+### The three-tier approach
+
+```
+1. probe_media({ "glob": "media/**/*.mp4" })
+   → metadata for all files (cheap, fast)
+
+2. Pick files that matter based on probe results
+
+3. Call analysis tools one file at a time:
+   understand_media({ "file_path": "..." })
+   get_transcript({ "file_path": "..." })
+```
+
+### Subagent orchestration (recommended for many files)
+
+When processing many files, launch **subagents** — context-isolated workers each with MCP access — instead of accumulating raw media analysis in a single context.
+
+**Why:** Each `understand_media` call returns transcript text and base64 images. Accumulating these for 10+ files floods the context window, causing compression and lost details. Subagents prevent this.
+
+**How:**
+
+1. Probe everything first: `probe_media` with a glob (cheap triage)
+2. Launch one subagent per file (or per small group)
+3. Pass each subagent a clear **intention**: _"Analyze this podcast episode. Extract the main topics discussed and any action items mentioned."_
+4. Each subagent calls `understand_media` / `get_transcript` / etc., then returns a **distilled summary**
+5. The orchestrator synthesizes summaries without ever accumulating raw media context
+
+Subagents are **sacrificial** — their full analysis context is discarded after they return their distilled result. This is the key insight: the orchestrator works with summaries, not raw transcripts and images.
+
+**When NOT to use subagents:**
+
+- Single file — just call `understand_media` directly
+- Quick metadata checks — `probe_media` is sufficient
+- 2-3 small files — serial `understand_media` calls are fine
+
+This is a **guideline**, not enforcement. The MCP server does not prevent serial `understand_media` calls in one context. But analysis quality degrades as context fills up with raw media data.
+
+## Safety and Budgets
+
+The server is conservative by default:
+
+- **Payload budgets:** Every response is capped at `max_total_chars` (default 32,000). If a response would exceed the budget, the server returns a natural-language error explaining how to adjust (narrow the window, request fewer images, etc.).
+- **Preflight checks:** Heavy tools reject obviously problematic requests before doing expensive work:
+  - `understand_media`: files over 2 hours (transcription bottleneck)
+  - `get_transcript`: files over 4 hours
+  - All heavy tools: files over 10 GB
+- **Bounded transcript cache:** In-memory LRU cache (max 32 entries, skips transcripts over 500K chars). Prevents unbounded memory growth.
+- **Concurrency limits:** Frame extraction is capped at 4 concurrent FFmpeg processes to control memory peaks.
+
+When the server rejects a request, it explains _why_ and suggests _what to do instead_ — it teaches the calling model to recover.
+
 ## CLI
 
 ```bash
@@ -332,22 +279,6 @@ Options:
   --max-chars <n>         Max transcript characters (default: 32000)
   -h, --help              Show help
 ```
-
-## Environment Variables
-
-| Variable                        | Default        | Description                    |
-| ------------------------------- | -------------- | ------------------------------ |
-| `MEDIA_UNDERSTANDING_MODEL`     | `base.en-q5_1` | Whisper model name             |
-| `MEDIA_UNDERSTANDING_MAX_CHARS` | `32000`        | Max transcript characters      |
-| `MEDIA_UNDERSTANDING_MAX_GRIDS` | `6`            | Max grid images per video call |
-
-## Whisper Models
-
-Default: `base.en-q5_1` (~57 MB, quantized). Models are cached at `~/.cache/media-understanding/models`.
-
-Standard models: `tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`, `medium.en`, `large-v1`, `large-v2`, `large-v3`
-
-Quantized models: `tiny.en-q5_1`, `base.en-q5_1`, `small.en-q5_1`, `large-v3-turbo-q5_0`
 
 ## Programmatic API
 
@@ -367,15 +298,27 @@ const grids = await extractFrameGridImages("/path/to/video.mp4", { maxGrids: 1 }
 const result = await understandMedia("/path/to/video.mp4");
 ```
 
-`understandMedia()` now returns both `grids` and richer `gridImages` metadata.
+`understandMedia()` returns `{ info, segments, transcript, grids, gridImages }`.
 
-## Notes
+## Environment Variables
 
-- Responses are intentionally capped so the LLM does not accidentally nuke its context window.
-- Batch mode is intentionally conservative.
-- If you ask for too much, the server returns natural-language errors telling the model how to recover.
+| Variable                        | Default        | Description                    |
+| ------------------------------- | -------------- | ------------------------------ |
+| `MEDIA_UNDERSTANDING_MODEL`     | `base.en-q5_1` | Whisper model name             |
+| `MEDIA_UNDERSTANDING_MAX_CHARS` | `32000`        | Max transcript characters      |
+| `MEDIA_UNDERSTANDING_MAX_GRIDS` | `6`            | Max grid images per video call |
 
-Thanks to Simon Willison for the inspiration around feeding timestamped video frames to LLMs. This library borrows that spirit while packaging it into a conservative MCP/server workflow.
+## Whisper Models
+
+Default: `base.en-q5_1` (~57 MB, quantized). Models are cached at `~/.cache/media-understanding/models`.
+
+Standard: `tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`, `medium.en`, `large-v1`, `large-v2`, `large-v3`
+
+Quantized: `tiny.en-q5_1`, `base.en-q5_1`, `small.en-q5_1`, `large-v3-turbo-q5_0`
+
+## Credits
+
+Thanks to [Simon Willison](https://simonwillison.net/) for the inspiration around feeding timestamped video frames to LLMs. This library borrows that spirit — multiple separate images per turn, uniform time-distributed sampling, visible timestamps on every frame — and packages it into a conservative MCP workflow.
 
 ## License
 
