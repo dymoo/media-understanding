@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  check-and-test:
+    name: check-all + test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate test fixtures
+        run: |
+          FFMPEG="node_modules/node-av/binary/ffmpeg"
+          # 1-second 440 Hz sine tone (WAV)
+          "$FFMPEG" -y -f lavfi -i "sine=frequency=440:duration=1" testdata/tiny.wav
+          # Same as MP3
+          "$FFMPEG" -y -f lavfi -i "sine=frequency=440:duration=1" testdata/tiny.mp3
+          # 5-second 320×240 colour-bars + sine audio (MP4)
+          "$FFMPEG" -y \
+            -f lavfi -i "testsrc=duration=5:size=320x240:rate=30" \
+            -f lavfi -i "sine=frequency=440:duration=5" \
+            -c:v libx264 -c:a aac \
+            testdata/tiny.mp4
+
+      - name: Run check-all (format + lint + typecheck)
+        run: pnpm run check-all
+
+      - name: Run tests (transcription skipped — no model in CI)
+        run: SKIP_TRANSCRIPTION=1 pnpm test

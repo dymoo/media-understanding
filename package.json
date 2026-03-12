@@ -1,0 +1,79 @@
+{
+  "name": "@dymoo/media-understanding",
+  "version": "0.1.0",
+  "description": "MCP server and CLI that converts audio/video/image to text + images for LLM consumption",
+  "type": "module",
+  "license": "MIT",
+  "author": "dymoo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dymoo/media-understanding.git"
+  },
+  "keywords": [
+    "mcp",
+    "llm",
+    "media",
+    "video",
+    "audio",
+    "transcription",
+    "whisper",
+    "ffmpeg",
+    "opencode",
+    "agents"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "media-understanding": "./dist/cli.js",
+    "media-understanding-mcp": "./dist/mcp.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "check-all": "pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "postinstall": "node node_modules/node-av/dist/ffmpeg/install.js",
+    "test": "node --test dist/tests/*.test.js",
+    "pretest": "tsc",
+    "prepublishOnly": "pnpm run check-all && pnpm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "file-type": "^21.3.1",
+    "node-av": "^5.2.2",
+    "sharp": "^0.34.5",
+    "zod": "^3.24.0"
+  },
+  "optionalDependencies": {
+    "@seydx/node-av-darwin-arm64": "^5.2.2",
+    "@seydx/node-av-darwin-x64": "^5.2.2",
+    "@seydx/node-av-linux-arm64": "^5.2.2",
+    "@seydx/node-av-linux-x64": "^5.2.2",
+    "@seydx/node-av-win32-arm64-mingw": "^5.2.2",
+    "@seydx/node-av-win32-arm64-msvc": "^5.2.2",
+    "@seydx/node-av-win32-x64-mingw": "^5.2.2",
+    "@seydx/node-av-win32-x64-msvc": "^5.2.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^20.0.0",
+    "@types/sharp": "^0.32.0",
+    "eslint": "^10.0.3",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.57.0"
+  }
+}

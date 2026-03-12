@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+*.env
+.env.*
+!.env.example
+coverage/
+testdata/*.mp4
+testdata/*.mp3
+testdata/*.wav
+testdata/*.m4a
