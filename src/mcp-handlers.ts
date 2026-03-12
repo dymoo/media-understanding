@@ -36,13 +36,13 @@ const DEFAULT_TOTAL_CHARS = 32_000;
 // ---------------------------------------------------------------------------
 
 /** Max file duration (seconds) for understand_media (transcribes full file). */
-const PREFLIGHT_MAX_DURATION_FULL = 7200; // 2 hours
+export const PREFLIGHT_MAX_DURATION_FULL = 7200; // 2 hours
 
 /** Max file duration (seconds) for get_transcript. */
-const PREFLIGHT_MAX_DURATION_TRANSCRIPT = 14_400; // 4 hours
+export const PREFLIGHT_MAX_DURATION_TRANSCRIPT = 14_400; // 4 hours
 
 /** Absolute max file size (bytes) for any heavy operation. */
-const PREFLIGHT_MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB
+export const PREFLIGHT_MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB
 
 export type UnderstandMediaArgs = {
   file_path: string;
@@ -113,7 +113,7 @@ export function mcpError(err: unknown): McpErrorResult {
 // Preflight checks — fail fast before expensive work
 // ---------------------------------------------------------------------------
 
-function formatDuration(seconds: number): string {
+export function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   if (h > 0 && m > 0) return `${h}h ${m}m`;
@@ -121,7 +121,7 @@ function formatDuration(seconds: number): string {
   return `${m}m`;
 }
 
-function preflightFileSize(info: MediaInfo, toolName: string): void {
+export function preflightFileSize(info: MediaInfo, toolName: string): void {
   if (info.fileSizeBytes !== undefined && info.fileSizeBytes > PREFLIGHT_MAX_FILE_SIZE) {
     const sizeGB = (info.fileSizeBytes / (1024 * 1024 * 1024)).toFixed(1);
     throw new MediaError(
@@ -133,7 +133,7 @@ function preflightFileSize(info: MediaInfo, toolName: string): void {
   }
 }
 
-function preflightDuration(info: MediaInfo, maxDuration: number, toolName: string): void {
+export function preflightDuration(info: MediaInfo, maxDuration: number, toolName: string): void {
   if (info.type !== "audio" && info.type !== "video") return;
   if (info.duration <= maxDuration) return;
 
