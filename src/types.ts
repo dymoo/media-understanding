@@ -179,6 +179,7 @@ export type MediaErrorCode =
   | "FRAME_FAILED"
   | "INVALID_SAMPLING"
   | "BUDGET_EXCEEDED"
+  | "FILE_TOO_LARGE"
   | "UNKNOWN";
 
 /** Structured error thrown by media processing functions. */

@@ -31,6 +31,19 @@ const ABSOLUTE_MAX_PROBE_FILES = 200;
 
 const DEFAULT_TOTAL_CHARS = 32_000;
 
+// ---------------------------------------------------------------------------
+// Preflight safety thresholds for heavy operations
+// ---------------------------------------------------------------------------
+
+/** Max file duration (seconds) for understand_media (transcribes full file). */
+const PREFLIGHT_MAX_DURATION_FULL = 7200; // 2 hours
+
+/** Max file duration (seconds) for get_transcript. */
+const PREFLIGHT_MAX_DURATION_TRANSCRIPT = 14_400; // 4 hours
+
+/** Absolute max file size (bytes) for any heavy operation. */
+const PREFLIGHT_MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB
+
 export type UnderstandMediaArgs = {
   file_path: string;
   model?: string | undefined;
@@ -94,6 +107,62 @@ export function mcpError(err: unknown): McpErrorResult {
     message = String(err);
   }
   return { isError: true, content: [{ type: "text", text: message }] };
+}
+
+// ---------------------------------------------------------------------------
+// Preflight checks — fail fast before expensive work
+// ---------------------------------------------------------------------------
+
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
+
+function preflightFileSize(info: MediaInfo, toolName: string): void {
+  if (info.fileSizeBytes !== undefined && info.fileSizeBytes > PREFLIGHT_MAX_FILE_SIZE) {
+    const sizeGB = (info.fileSizeBytes / (1024 * 1024 * 1024)).toFixed(1);
+    throw new MediaError(
+      "FILE_TOO_LARGE",
+      `This file is ${sizeGB} GB — too large for ${toolName}. ` +
+        `Maximum supported file size is 10 GB. ` +
+        `Try a smaller file or re-encode at a lower bitrate.`,
+    );
+  }
+}
+
+function preflightDuration(info: MediaInfo, maxDuration: number, toolName: string): void {
+  if (info.type !== "audio" && info.type !== "video") return;
+  if (info.duration <= maxDuration) return;
+
+  const durationStr = formatDuration(info.duration);
+  const maxStr = formatDuration(maxDuration);
+
+  let guidance: string;
+  if (toolName === "understand_media") {
+    guidance =
+      "Note: understand_media transcribes the entire audio track regardless of " +
+      "start_sec/end_sec (those only affect visual grid extraction).\n\n" +
+      "For long media, use the focused tools instead:\n" +
+      "1. get_video_grids with start_sec/end_sec — sample visual content from specific sections (fast)\n" +
+      "2. get_transcript — transcribe speech content (supports files up to " +
+      formatDuration(PREFLIGHT_MAX_DURATION_TRANSCRIPT) +
+      ")\n" +
+      "3. get_frames — extract exact moments identified from transcripts or grids";
+  } else {
+    guidance =
+      "For very long audio/video:\n" +
+      "- Use probe_media first to check duration and plan your approach\n" +
+      "- Use get_video_grids with start_sec/end_sec for visual sampling of specific sections\n" +
+      "- Consider whether a summary of an initial portion is sufficient";
+  }
+
+  throw new MediaError(
+    "FILE_TOO_LARGE",
+    `This file is ${durationStr} long. ${toolName} is not recommended for files over ${maxStr}.\n\n${guidance}`,
+  );
 }
 
 function getTotalCharBudget(maxTotalChars?: number): number {
@@ -287,6 +356,10 @@ export async function handleUnderstandMedia(
   args: UnderstandMediaArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
+    const info = await probeMedia(args.file_path);
+    preflightFileSize(info, "understand_media");
+    preflightDuration(info, PREFLIGHT_MAX_DURATION_FULL, "understand_media");
+
     const maxTotalChars = getTotalCharBudget(args.max_total_chars);
 
     const result = await understandMedia(
@@ -427,6 +500,9 @@ export async function handleGetVideoGrids(
   args: GetVideoGridsArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
+    const info = await probeMedia(args.file_path);
+    preflightFileSize(info, "get_video_grids");
+
     const grids = await extractFrameGridImages(
       args.file_path,
       buildOpts({
@@ -511,6 +587,9 @@ export async function handleGetFrames(
   args: GetFramesArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
+    const info = await probeMedia(args.file_path);
+    preflightFileSize(info, "get_frames");
+
     const maxTotalChars = getTotalCharBudget(args.max_total_chars);
     const content: McpContentItem[] = [];
 
@@ -550,6 +629,10 @@ export async function handleGetTranscript(
   args: GetTranscriptArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
+    const info = await probeMedia(args.file_path);
+    preflightFileSize(info, "get_transcript");
+    preflightDuration(info, PREFLIGHT_MAX_DURATION_TRANSCRIPT, "get_transcript");
+
     const maxChars =
       args.max_chars ?? parseInt(process.env["MEDIA_UNDERSTANDING_MAX_CHARS"] ?? "32000", 10);
 

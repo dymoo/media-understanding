@@ -31,10 +31,43 @@ import { MediaError } from "./types.js";
 const execFile = promisify(execFileCb);
 
 // ---------------------------------------------------------------------------
-// In-memory transcript cache (keyed by SHA-256 content fingerprint: size + first 64 KB + last 64 KB)
+// Bounded LRU transcript cache (keyed by SHA-256 content fingerprint).
+// Max 32 entries; transcripts exceeding 500K chars of segment text are not
+// cached to avoid unbounded memory growth on very long files.
 // ---------------------------------------------------------------------------
 
-const transcriptCache = new Map<string, Segment[]>();
+const TRANSCRIPT_CACHE_MAX_ENTRIES = 32;
+const TRANSCRIPT_CACHE_MAX_TEXT_CHARS = 500_000;
+
+class TranscriptCache {
+  private cache = new Map<string, Segment[]>();
+
+  get(key: string): Segment[] | undefined {
+    const value = this.cache.get(key);
+    if (value !== undefined) {
+      // Promote to most-recently-used (Map preserves insertion order)
+      this.cache.delete(key);
+      this.cache.set(key, value);
+    }
+    return value;
+  }
+
+  set(key: string, segments: Segment[]): void {
+    const totalChars = segments.reduce((sum, s) => sum + s.text.length, 0);
+    if (totalChars > TRANSCRIPT_CACHE_MAX_TEXT_CHARS) return;
+
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= TRANSCRIPT_CACHE_MAX_ENTRIES) {
+      // Evict least-recently-used (first entry in Map iteration order)
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
+    }
+    this.cache.set(key, segments);
+  }
+}
+
+const transcriptCache = new TranscriptCache();
 
 // ---------------------------------------------------------------------------
 // Extension fallback for formats file-type cannot detect via magic bytes
@@ -61,6 +94,7 @@ const DEFAULT_ROWS = 4;
 const DEFAULT_THUMB_WIDTH = 480;
 const DEFAULT_ASPECT_MODE = "contain" as const;
 const DEFAULT_SAMPLING_STRATEGY = "uniform" as const;
+const FRAME_EXTRACTION_CONCURRENCY = 4;
 const OVERLAY_BANNER_HEIGHT = 34;
 const OVERLAY_FONT_SIZE = 20;
 const OVERLAY_PADDING = 8;
@@ -196,6 +230,31 @@ export function truncateTranscript(text: string, maxChars: number): string {
   const keep1 = Math.floor(maxChars * 0.6);
   const keep2 = maxChars - keep1;
   return text.slice(0, keep1) + "\n\n[…transcript truncated…]\n\n" + text.slice(-keep2);
+}
+
+/**
+ * Map over items with bounded concurrency.
+ * At most `limit` items are processed simultaneously.
+ * Safe in single-threaded JS: index increment is synchronous between await points.
+ */
+async function mapWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await fn(items[i]!);
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 function formatTimestamp(timestampSec: number): string {
@@ -599,8 +658,10 @@ export async function extractFrameGridImages(
   try {
     const grids: VideoGridImage[] = [];
     for (const plan of plans) {
-      const frames = await Promise.all(
-        plan.timestampsSec.map((timestampSec) => buildVideoFrameImage(abs, timestampSec, abs)),
+      const frames = await mapWithLimit(
+        plan.timestampsSec,
+        FRAME_EXTRACTION_CONCURRENCY,
+        (timestampSec) => buildVideoFrameImage(abs, timestampSec, abs),
       );
 
       if (frames.length === 0) continue;
