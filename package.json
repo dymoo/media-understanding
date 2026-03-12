@@ -1,7 +1,7 @@
 {
   "name": "@dymoo/media-understanding",
   "version": "0.1.0",
-  "description": "MCP server and CLI that converts audio/video/image to text + images for LLM consumption",
+  "description": "MCP server that converts audio/video/image to text + images for LLM consumption",
   "type": "module",
   "license": "MIT",
   "author": "dymoo",
@@ -22,7 +22,7 @@
     "agents"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "exports": {
     ".": "./dist/index.js"
@@ -69,7 +69,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "@types/sharp": "^0.32.0",
     "eslint": "^10.0.3",
     "eslint-config-prettier": "^10.1.8",

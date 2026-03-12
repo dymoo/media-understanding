@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 /**
- * CLI shim — text-only output suitable for use as an OpenClaw media model.
+ * CLI stub — lightweight probe-only output for OpenClaw media model integration.
+ *
+ * Runs probeMedia() (~5-50ms, header read only) and outputs metadata plus
+ * guidance to use the MCP tools for full analysis. No transcription, no grid
+ * extraction, no heavy work.
  *
  * Usage:
- *   media-understanding <file> [--model <whisper-model>] [--max-chars <n>]
- *
- * Outputs:
- *   - Metadata block
- *   - Transcript (audio/video)
- *   - Frame timestamps are NOT output in CLI mode (images not printable)
+ *   media-understanding <file>
+ *   media-understanding --help
+ *   media-understanding --version
  *
  * Exit codes: 0 = success, 1 = error
  */
@@ -18,7 +19,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { probeMedia, transcribeAudio, truncateTranscript } from "./media.js";
+import { probeMedia } from "./media.js";
 import { MediaError } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -29,8 +30,6 @@ const { version } = JSON.parse(readFileSync(join(__dirname, "../package.json"), 
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: {
-    model: { type: "string", short: "m" },
-    "max-chars": { type: "string" },
     help: { type: "boolean", short: "h" },
     version: { type: "boolean", short: "V" },
   },
@@ -44,17 +43,14 @@ if (values.version) {
 
 if (values.help || positionals.length === 0) {
   process.stdout.write(
-    `Usage: media-understanding <file> [options]
+    `Usage: media-understanding <file>
+
+Runs a quick metadata probe (~50ms) and outputs file info plus MCP tool guidance.
+For full analysis (transcription, keyframe grids, etc.), use the MCP server tools.
 
 Options:
-  -m, --model <name>      Whisper model (default: base.en-q5_1)
-  --max-chars <n>         Max transcript characters (default: 32000)
-  -h, --help              Show this help
-  -V, --version           Print version number
-
-Environment:
-  MEDIA_UNDERSTANDING_MODEL      Override default Whisper model
-  MEDIA_UNDERSTANDING_MAX_CHARS  Override max transcript characters
+  -h, --help     Show this help
+  -V, --version  Print version number
 `,
   );
   process.exit(0);
@@ -66,48 +62,46 @@ if (!filePath) {
   process.exit(1);
 }
 
-const model = values.model;
-const maxCharsRaw = values["max-chars"];
-const maxCharsEnv = parseInt(process.env["MEDIA_UNDERSTANDING_MAX_CHARS"] ?? "32000", 10);
-const maxChars = maxCharsRaw !== undefined ? parseInt(maxCharsRaw, 10) : maxCharsEnv;
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 
-if (isNaN(maxChars) || maxChars <= 0) {
-  process.stderr.write(
-    `Error: --max-chars must be a positive integer, got: "${maxCharsRaw ?? ""}"\n`,
-  );
-  process.exit(1);
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}h${m > 0 ? ` ${m}m` : ""}`;
+  if (m > 0) return `${m}m${s > 0 ? `${s}s` : ""}`;
+  return `${s}s`;
 }
 
 try {
   const info = await probeMedia(filePath);
 
-  const lines: string[] = [
-    `file: ${info.path}`,
-    `type: ${info.type}`,
-    `duration: ${info.duration.toFixed(1)}s`,
-  ];
-  if (info.width) lines.push(`resolution: ${info.width}x${info.height}`);
-  if (info.fps) lines.push(`fps: ${info.fps.toFixed(2)}`);
-  if (info.videoCodec) lines.push(`video_codec: ${info.videoCodec}`);
-  if (info.audioCodec) lines.push(`audio_codec: ${info.audioCodec}`);
-  if (info.sampleRate) lines.push(`sample_rate: ${info.sampleRate}Hz`);
-  if (info.channels) lines.push(`channels: ${info.channels}`);
+  const typeBadge = `[${info.type.charAt(0).toUpperCase() + info.type.slice(1)}]`;
+  const parts: string[] = [typeBadge];
 
-  process.stdout.write(lines.join("\n") + "\n");
+  if (info.type !== "image") parts.push(formatDuration(info.duration));
+  if (info.width !== undefined) parts.push(`${info.width}x${info.height}`);
+  if (info.videoCodec && info.audioCodec) parts.push(`${info.videoCodec}/${info.audioCodec}`);
+  else if (info.audioCodec) parts.push(info.audioCodec);
+  if (info.fileSizeBytes !== undefined) parts.push(formatSize(info.fileSizeBytes));
 
-  if (info.type === "audio" || info.type === "video") {
-    const segments = await transcribeAudio(filePath, model !== undefined ? { model } : {});
+  process.stdout.write(
+    `${parts.join(" ")}
 
-    if (segments.length === 0) {
-      process.stdout.write("\n[no speech detected]\n");
-    } else {
-      const raw = segments
-        .map((s) => s.text)
-        .join(" ")
-        .trim();
-      process.stdout.write("\n--- TRANSCRIPT ---\n" + truncateTranscript(raw, maxChars) + "\n");
-    }
-  }
+This file has been detected by the media-understanding CLI.
+Use your media-understanding MCP tools for full analysis:
+  - probe_media: batch metadata scanning
+  - understand_media: full analysis (transcript + keyframe grids)
+  - get_transcript: speech content with format options (text/srt/json)
+  - get_video_grids: visual keyframe inspection
+  - get_frames: exact frame extraction at specific timestamps
+`,
+  );
 } catch (err) {
   const message =
     err instanceof MediaError

@@ -11,6 +11,63 @@ Turn audio, video, and images into the two modalities LLMs actually accept: **te
 ## Agent Setup
 
 <details>
+<summary>OpenClaw</summary>
+
+OpenClaw supports two integration points that work together:
+
+1. **MCP server** — gives the agent 5 media analysis tools in the reply pipeline
+2. **Media model stub** — pre-digests inbound media at conversation start (~50ms probe, no heavy work)
+
+```json5
+{
+  // 1. MCP server — 5 tools for media analysis in the reply pipeline
+  mcpServers: {
+    "media-understanding": {
+      command: "media-understanding-mcp",
+    },
+  },
+
+  // 2. Media model — pre-digests inbound media before the reply pipeline.
+  //    Runs a quick probe (~50ms) and tells the agent to use MCP tools
+  //    for full analysis. No transcription, no heavy work at pre-digest time.
+  tools: {
+    media: {
+      models: [
+        {
+          type: "cli",
+          command: "media-understanding",
+          args: ["{{MediaPath}}"],
+          capabilities: ["audio", "video", "image"],
+          maxBytes: 10737418240, // 10 GB — let the MCP tools handle size limits
+          timeoutSeconds: 10, // probe is fast
+        },
+      ],
+    },
+  },
+}
+```
+
+**Why this works well:** The media model stub is instant (~50ms header read) and gives the agent a metadata summary plus a nudge to use MCP tools. The agent then has full iterative control — it chooses which tools to call based on the media type and its current task. No API keys needed, works offline, no wasted compute on pre-digestion.
+
+**What the agent sees from the media model stub:**
+
+```
+[Video] 2m15s, 1920x1080, h264/aac, 48.2 MB
+
+This file has been detected by the media-understanding CLI.
+Use your media-understanding MCP tools for full analysis:
+  - probe_media: batch metadata scanning
+  - understand_media: full analysis (transcript + keyframe grids)
+  - get_transcript: speech content with format options (text/srt/json)
+  - get_video_grids: visual keyframe inspection
+  - get_frames: exact frame extraction at specific timestamps
+```
+
+The agent then calls MCP tools for the actual work, with full iterative capability.
+
+</details>
+
+<details>
 <summary>OpenCode</summary>
 
 Add to `~/.config/opencode/opencode.json`:
@@ -114,7 +171,7 @@ npm install @dymoo/media-understanding
 
 Requirements:
 
-- Node >= 20
+- Node >= 22
 - FFmpeg is handled automatically via `node-av`
 - The default Whisper model (`base.en-q5_1`, ~57 MB) downloads on first use; set `SKIP_MODEL_DOWNLOAD=1` to defer
 
@@ -128,7 +185,7 @@ Step 1: DISCOVER (cheap, batch-safe)
 
 Step 2: ANALYZE (expensive, one file at a time)
   understand_media  →  full analysis: metadata + transcript + keyframe grids
-  get_transcript    →  timestamped speech text
+  get_transcript    →  timestamped speech text (text, SRT, or JSON format)
   get_video_grids   →  visual keyframe contact sheets
   get_frames        →  exact frames at specific timestamps
 
@@ -145,18 +202,19 @@ The cost boundary between cheap and expensive operations is encoded in the tool 
 
 Scan files for metadata before committing to heavy analysis. Returns type, duration, resolution, codecs, file size. No decoding, no transcription, no images.
 
-Accepts exactly one of `file_path`, `file_paths`, or `glob`. Default limit: 50 files (max 200).
+Accepts a `paths` parameter: a string or array of strings. Each string can be a literal file path or a glob pattern. Default limit: 50 files (max 200).
 
 ```json
-{ "file_path": "/path/to/video.mp4" }
-{ "file_paths": ["/path/to/a.mp4", "/path/to/b.mp3"] }
-{ "glob": "media/**/*.{mp4,mp3,wav}" }
-{ "glob": "recordings/*.mp4", "max_files": 100 }
+{ "paths": "/path/to/video.mp4" }
+{ "paths": ["recordings/*.mp4", "specific/file.mp3"] }
+{ "paths": "media/**/*.{mp4,mp3,wav}", "max_files": 100 }
 ```
 
 ### `understand_media` — full single-file analysis
 
-Returns metadata + transcript + keyframe grids for one file. Best for images, short audio, and short-to-medium video. For files over 2 hours, use the focused tools below instead.
+Returns metadata + transcript + keyframe grids for one file. For video, transcript segments are interleaved with their corresponding grid images — each grid is preceded by the transcript chunk covering that time window, so the LLM sees speech and visuals together in chronological order.
+
+Best for images, short audio, and short-to-medium video. For files over 2 hours, use the focused tools below instead.
 
 ```json
 { "file_path": "/path/to/video.mp4" }
@@ -166,14 +224,28 @@ Returns metadata + transcript + keyframe grids for one file. Best for images, sh
 
 Key options: `model`, `max_chars`, `max_total_chars`, `max_grids`, `start_sec`, `end_sec`, `sampling_strategy`, `seconds_per_frame`, `seconds_per_grid`, `cols`, `rows`, `thumb_width`, `aspect_mode`.
 
-### `get_transcript` — speech content only
+### `get_transcript` — speech content with format options
 
-Timestamped transcript text. Supports files up to 4 hours. Each line includes `[start-end]` timestamps.
+Timestamped transcript with three output formats:
+
+- **`text`** (default) — `[start-end] text` per segment, compact and scannable
+- **`srt`** — standard SRT subtitle format with `HH:MM:SS,mmm` timestamps
+- **`json`** — machine-readable `{ segments: [{ start, end, text }] }` with millisecond precision
+
+Optional time windowing with `start_sec`/`end_sec` filters the output to a specific range (the full file is still transcribed once, then cached).
 
 ```json
 { "file_path": "/path/to/podcast.mp3" }
-{ "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }
+{ "file_path": "/path/to/meeting.mp4", "format": "srt" }
+{ "file_path": "/path/to/episode.mp3", "format": "json", "start_sec": 60, "end_sec": 120 }
 ```
+
+**Two-step workflow for long media:**
+
+1. **Overview** — `get_transcript(file, { format: "srt" })` to scan for topics and transitions
+2. **Detail** — `get_transcript(file, { format: "json", start_sec: 120, end_sec: 300 })` for precise segment data in a specific range
+
+This avoids dumping the entire transcript into context at once.
 
 ### `get_video_grids` — visual keyframe sampling
 
@@ -185,6 +257,10 @@ JPEG contact sheets of thumbnails. Every tile has an exact timestamp overlay. Bu
 { "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }
 ```
 
+**Example output** — 4x4 grid from a 61-second portrait video (`thumb_width: 120, aspect_mode: "contain"`):
+
+![Example keyframe grid from get_video_grids — 4x4 contact sheet covering 0-61s with timestamp overlays on each tile](docs/assets/example-grid.jpg)
+
 ### `get_frames` — exact moments
 
 One JPEG per requested timestamp. Each frame includes a timestamp overlay.
@@ -193,6 +269,10 @@ One JPEG per requested timestamp. Each frame includes a timestamp overlay.
 { "file_path": "/path/to/video.mp4", "timestamps": [0, 30, 60] }
 { "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }
 ```
+
+**Example output** — single frame at t=30s:
+
+![Example frame from get_frames — single frame extracted at 00:00:30.000 with filename and timestamp overlay](docs/assets/example-frame.jpg)
 
 ## Recommended LLM Workflow
 
@@ -214,6 +294,15 @@ One JPEG per requested timestamp. Each frame includes a timestamp overlay.
 
 Narrow the window — don't widen it. Each follow-up call should be more targeted than the last.
 
+### Podcast / long audio workflow
+
+For analyzing podcasts or long audio files:
+
+1. **Overview pass** — `get_transcript(file, { format: "srt" })` to get a timestamped overview of the full episode. Scan the SRT to identify interesting segments, topic transitions, or key moments.
+2. **Detail pass** — `get_transcript(file, { format: "json", start_sec: 120, end_sec: 300 })` to get precise segment data for a specific time range. Use for quoting, summarizing, or extracting specific portions.
+
+The SRT overview is compact and scannable; the JSON detail pass gives exact data for the segments that matter.
+
 ## Processing Multiple Files
 
 For a single file, call `understand_media` directly. For multiple files, follow the three-tier workflow.
@@ -221,7 +310,7 @@ For a single file, call `understand_media` directly. For multiple files, follow 
 ### The three-tier approach
 
 ```
-1. probe_media({ "glob": "media/**/*.mp4" })
+1. probe_media({ "paths": "media/**/*.mp4" })
    → metadata for all files (cheap, fast)
 
 2. Pick files that matter based on probe results
@@ -259,7 +348,8 @@ This is a **guideline**, not enforcement. The MCP server does not prevent serial
 
 The server is conservative by default:
 
-- **Payload budgets:** Every response is capped at `max_total_chars` (default 32,000). If a response would exceed the budget, the server returns a natural-language error explaining how to adjust (narrow the window, request fewer images, etc.).
+- **Payload budgets:** Every response is capped at `max_total_chars` (default 48,000). If a response would exceed the budget, the server returns a natural-language error explaining how to adjust (narrow the window, request fewer images, etc.), including the overage ratio and resolution-aware suggestions for reducing image sizes. Budget guidance is context-aware: grid errors suggest `cols`/`rows`/`thumb_width`, while frame errors suggest fewer timestamps or splitting requests.
+- **Portrait-aware grid defaults:** When grid parameters (`cols`, `rows`, `thumb_width`) are omitted, portrait video (height > width) defaults to `3x3` grids at `120px` thumbnail width instead of the standard `4x4` at `480px`. This prevents portrait video grids from immediately exceeding the default budget. Explicit values always override these defaults.
 - **Preflight checks:** Heavy tools reject obviously problematic requests before doing expensive work:
   - `understand_media`: files over 2 hours (transcription bottleneck)
   - `get_transcript`: files over 4 hours
@@ -268,17 +358,6 @@ The server is conservative by default:
 - **Concurrency limits:** Frame extraction is capped at 4 concurrent FFmpeg processes to control memory peaks.
 
 When the server rejects a request, it explains _why_ and suggests _what to do instead_ — it teaches the calling model to recover.
-
-## CLI
-
-```bash
-media-understanding <file> [options]
-
-Options:
-  -m, --model <name>      Whisper model (default: base.en-q5_1)
-  --max-chars <n>         Max transcript characters (default: 32000)
-  -h, --help              Show help
-```
 
 ## Programmatic API
 

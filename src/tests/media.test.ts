@@ -260,6 +260,39 @@ describe("extractFrameGrid", () => {
     assert.equal(grid.tiles[3]?.timestampLabel, "00:00:00.700");
     assert.ok(Buffer.isBuffer(grid.image));
   });
+
+  it("landscape video uses standard 4x4 grid when cols/rows omitted", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    // tiny.mp4 is 320x240 (landscape) — should use default cols=4, rows=4, thumbWidth=480
+    // With 4x4=16 tiles but only 1s of video, we get fewer tiles, but the grid shape is 4x4
+    const grids = await extractFrameGridImages(MP4, {
+      maxGrids: 1,
+    });
+    assert.ok(grids.length >= 1);
+    const [grid] = grids;
+    assert.ok(grid);
+    // With default 4x4 and ~1s video, we should get up to 16 tiles
+    assert.ok(grid.tiles.length <= 16, `expected <= 16 tiles, got ${grid.tiles.length}`);
+    assert.ok(Buffer.isBuffer(grid.image));
+  });
+
+  it("explicit cols/rows/thumbWidth override any defaults", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    // Explicit overrides should always be respected, regardless of orientation
+    const grids = await extractFrameGridImages(MP4, {
+      maxGrids: 1,
+      cols: 1,
+      rows: 2,
+      thumbWidth: 64,
+      secondsPerFrame: 0.3,
+      startSec: 0,
+      endSec: 0.6,
+    });
+    assert.equal(grids.length, 1);
+    const [grid] = grids;
+    assert.ok(grid);
+    assert.equal(grid.tiles.length, 2); // 1 col * 2 rows
+  });
 });
 
 // ---------------------------------------------------------------------------

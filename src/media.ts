@@ -93,6 +93,12 @@ const DEFAULT_COLS = 4;
 const DEFAULT_ROWS = 4;
 const DEFAULT_THUMB_WIDTH = 480;
 const DEFAULT_ASPECT_MODE = "contain" as const;
+
+// Portrait video (height > width) produces tall tiles that blow up grid payloads.
+// When the caller omits grid-shape params, use these smaller overview-oriented defaults.
+const PORTRAIT_DEFAULT_COLS = 3;
+const PORTRAIT_DEFAULT_ROWS = 3;
+const PORTRAIT_DEFAULT_THUMB_WIDTH = 120;
 const DEFAULT_SAMPLING_STRATEGY = "uniform" as const;
 const FRAME_EXTRACTION_CONCURRENCY = 4;
 const OVERLAY_BANNER_HEIGHT = 34;
@@ -652,7 +658,19 @@ export async function extractFrameGridImages(
     throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${abs}`);
   }
 
-  const normalized = normalizeGridOptions(opts, info.duration);
+  // Apply portrait-aware defaults when the caller omits grid-shape params.
+  const isPortrait =
+    info.width !== undefined && info.height !== undefined && info.height > info.width;
+  const effectiveOpts: GridOptions = isPortrait
+    ? {
+        ...opts,
+        cols: opts.cols ?? PORTRAIT_DEFAULT_COLS,
+        rows: opts.rows ?? PORTRAIT_DEFAULT_ROWS,
+        thumbWidth: opts.thumbWidth ?? PORTRAIT_DEFAULT_THUMB_WIDTH,
+      }
+    : opts;
+
+  const normalized = normalizeGridOptions(effectiveOpts, info.duration);
   const plans = planVideoSampling(normalized, info.duration);
 
   try {

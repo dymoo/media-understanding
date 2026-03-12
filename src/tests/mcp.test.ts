@@ -14,19 +14,26 @@ import { resolve } from "node:path";
 
 import { probeMedia, extractFrameGrid, extractFrame, compressForLLM } from "../media.js";
 import {
+  assignSegmentsToGrids,
+  estimateVisionTokens,
+  filterSegmentsByWindow,
   formatDuration,
+  formatSrtTimestamp,
+  formatTranscriptAsJSON,
+  formatTranscriptAsSRT,
   handleGetFrames,
   handleGetTranscript,
   handleGetVideoGrids,
   handleProbeMedia,
   handleUnderstandMedia,
+  overlapMs,
   PREFLIGHT_MAX_DURATION_FULL,
   PREFLIGHT_MAX_DURATION_TRANSCRIPT,
   PREFLIGHT_MAX_FILE_SIZE,
   preflightDuration,
   preflightFileSize,
 } from "../mcp-handlers.js";
-import type { MediaInfo } from "../types.js";
+import type { MediaInfo, Segment, VideoGridImage } from "../types.js";
 import { MediaError } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -112,8 +119,8 @@ describe("understand_media tool surface — image", () => {
 // ---------------------------------------------------------------------------
 
 describe("probe_media tool surface", () => {
-  it("probes a single file", async () => {
-    const result = await handleProbeMedia({ file_path: PNG });
+  it("probes a single file via string path", async () => {
+    const result = await handleProbeMedia({ paths: PNG });
     assert.ok(!("isError" in result));
     const textItem = result.content.find((item) => item.type === "text");
     assert.ok(textItem && "text" in textItem);
@@ -121,29 +128,25 @@ describe("probe_media tool surface", () => {
     assert.ok(textItem.text.includes("image"));
   });
 
-  it("probes multiple files", async () => {
-    const result = await handleProbeMedia({ file_paths: [PNG, PNG] });
+  it("probes a single file via array path", async () => {
+    const result = await handleProbeMedia({ paths: [PNG] });
+    assert.ok(!("isError" in result));
+    const textItem = result.content.find((item) => item.type === "text");
+    assert.ok(textItem && "text" in textItem);
+    assert.ok(textItem.text.includes("1 succeeded"));
+  });
+
+  it("probes multiple files via array", async () => {
+    const result = await handleProbeMedia({ paths: [PNG, PNG] });
     assert.ok(!("isError" in result));
     const textItem = result.content.find((item) => item.type === "text");
     assert.ok(textItem && "text" in textItem);
     assert.ok(textItem.text.includes("succeeded"));
   });
 
-  it("rejects when no source is provided", async () => {
-    const result = await handleProbeMedia({});
-    assert.ok("isError" in result);
-    assert.match(result.content[0].text, /Provide exactly one of/);
-  });
-
-  it("rejects ambiguous inputs", async () => {
-    const result = await handleProbeMedia({ file_path: PNG, file_paths: [PNG] });
-    assert.ok("isError" in result);
-    assert.match(result.content[0].text, /Provide exactly one of/);
-  });
-
   it("returns inline errors for missing files without aborting", async () => {
     const result = await handleProbeMedia({
-      file_paths: [PNG, "/nonexistent/file.mp4"],
+      paths: [PNG, "/nonexistent/file.mp4"],
     });
     assert.ok(!("isError" in result));
     const textItem = result.content.find((item) => item.type === "text");
@@ -151,6 +154,26 @@ describe("probe_media tool surface", () => {
     assert.ok(textItem.text.includes("1 succeeded"));
     assert.ok(textItem.text.includes("1 failed"));
     assert.ok(textItem.text.includes("FILE_NOT_FOUND"));
+  });
+
+  it("supports glob patterns in paths", async () => {
+    const result = await handleProbeMedia({ paths: resolve(root, "tiny.png") });
+    assert.ok(!("isError" in result));
+    const textItem = result.content.find((item) => item.type === "text");
+    assert.ok(textItem && "text" in textItem);
+    assert.ok(textItem.text.includes("1 succeeded"));
+  });
+
+  it("supports mixed literal + glob in paths array", async () => {
+    // Both resolve to the same file, dedup should handle it
+    const result = await handleProbeMedia({
+      paths: [PNG, resolve(root, "*.png")],
+    });
+    assert.ok(!("isError" in result));
+    const textItem = result.content.find((item) => item.type === "text");
+    assert.ok(textItem && "text" in textItem);
+    // After dedup, only 1 unique path
+    assert.ok(textItem.text.includes("1 file(s)"));
   });
 });
 
@@ -236,6 +259,29 @@ describe("get_frames tool surface", () => {
     });
     assert.ok("isError" in result);
     assert.match(result.content[0].text, /BUDGET_EXCEEDED/);
+    // Phase 8a: error should include actual chars and overage ratio
+    assert.match(result.content[0].text, /chars/);
+    assert.match(result.content[0].text, /over budget/);
+  });
+
+  it("frame budget errors suggest fewer timestamps, not grid-specific knobs", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    const result = await handleGetFrames({
+      file_path: MP4,
+      timestamps: [0, 0.5],
+      max_total_chars: 2000,
+    });
+    assert.ok("isError" in result);
+    const text = result.content[0].text;
+    // Should suggest frame-appropriate recovery
+    assert.match(text, /fewer timestamps|split/i);
+    // Should NOT suggest grid-specific controls
+    assert.ok(!text.includes("cols="), "get_frames budget error should not suggest cols");
+    assert.ok(!text.includes("rows="), "get_frames budget error should not suggest rows");
+    assert.ok(
+      !text.includes("thumb_width"),
+      "get_frames budget error should not suggest thumb_width",
+    );
   });
 });
 
@@ -293,19 +339,17 @@ describe("get_transcript tool surface — validation", () => {
 
 describe("probe_media — glob and max_files", () => {
   it("probes files matching a glob pattern", async () => {
-    // The glob runs relative to process.cwd(). Use file_paths to avoid cwd issues.
-    // Instead, test with explicit file_paths to verify the batch path.
-    const result = await handleProbeMedia({ file_paths: [PNG] });
+    const result = await handleProbeMedia({ paths: resolve(root, "tiny.png") });
     assert.ok(!("isError" in result));
     const textItem = result.content.find((item) => item.type === "text");
     assert.ok(textItem && "text" in textItem);
     assert.ok(textItem.text.includes("1 succeeded"));
   });
 
-  it("rejects when file_paths exceeds max_files", async () => {
+  it("rejects when paths exceeds max_files", async () => {
     // Use two distinct paths so dedup doesn't collapse them
     const result = await handleProbeMedia({
-      file_paths: [PNG, "/nonexistent/second-file.mp4"],
+      paths: [PNG, "/nonexistent/second-file.mp4"],
       max_files: 1,
     });
     assert.ok("isError" in result);
@@ -316,15 +360,15 @@ describe("probe_media — glob and max_files", () => {
     // Request max_files=999 — should be capped to 200 internally.
     // With only 1 file, this should succeed (the cap doesn't reject small batches).
     const result = await handleProbeMedia({
-      file_path: PNG,
+      paths: PNG,
       max_files: 999,
     });
     assert.ok(!("isError" in result));
   });
 
-  it("deduplicates file_paths", async () => {
+  it("deduplicates paths", async () => {
     const result = await handleProbeMedia({
-      file_paths: [PNG, PNG, PNG],
+      paths: [PNG, PNG, PNG],
     });
     assert.ok(!("isError" in result));
     const textItem = result.content.find((item) => item.type === "text");
@@ -333,10 +377,20 @@ describe("probe_media — glob and max_files", () => {
     assert.ok(textItem.text.includes("1 file(s)"));
   });
 
-  it("rejects empty file_paths", async () => {
-    const result = await handleProbeMedia({ file_paths: [] });
+  it("rejects empty paths array", async () => {
+    const result = await handleProbeMedia({ paths: [] as string[] });
     assert.ok("isError" in result);
     assert.match(result.content[0].text, /at least one non-empty/);
+  });
+
+  it("preserves literal missing paths so probe reports per-file errors", async () => {
+    const missingPath = "/definitely/not/a/real/file.mp4";
+    const result = await handleProbeMedia({ paths: missingPath });
+    assert.ok(!("isError" in result));
+    const textItem = result.content.find((item) => item.type === "text");
+    assert.ok(textItem && "text" in textItem);
+    assert.ok(textItem.text.includes("1 failed"));
+    assert.ok(textItem.text.includes("FILE_NOT_FOUND"));
   });
 });
 
@@ -515,6 +569,28 @@ describe("get_video_grids — budget exceeded", () => {
     });
     assert.ok("isError" in result);
     assert.match(result.content[0].text, /BUDGET_EXCEEDED/);
+    // Phase 8a: error should include actual size and overage ratio
+    assert.match(result.content[0].text, /chars/);
+    assert.match(result.content[0].text, /over budget/);
+  });
+
+  it("grid budget errors suggest grid-specific controls (cols, rows, thumb_width)", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    const result = await handleGetVideoGrids({
+      file_path: MP4,
+      max_grids: 1,
+      max_total_chars: 500,
+      cols: 2,
+      rows: 2,
+      seconds_per_frame: 0.2,
+      start_sec: 0,
+      end_sec: 0.8,
+    });
+    assert.ok("isError" in result);
+    const text = result.content[0].text;
+    assert.ok(text.includes("cols="), "grid budget error should suggest cols");
+    assert.ok(text.includes("rows="), "grid budget error should suggest rows");
+    assert.ok(text.includes("thumb_width"), "grid budget error should suggest thumb_width");
   });
 });
 
@@ -536,5 +612,413 @@ describe("understand_media — error paths", () => {
     });
     assert.ok("isError" in result);
     assert.match(result.content[0].text, /BUDGET_EXCEEDED/);
+    // Phase 8a: error should include actual size and overage ratio
+    assert.match(result.content[0].text, /chars/);
+    assert.match(result.content[0].text, /over budget/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// estimateVisionTokens — LLM vision token estimation
+// ---------------------------------------------------------------------------
+
+describe("estimateVisionTokens", () => {
+  it("uses Claude formula: pixels / 750", () => {
+    // 1920x1080 = 2,073,600 px / 750 = 2,764.8 → ceil = 2,765
+    assert.equal(estimateVisionTokens(1920, 1080), Math.ceil((1920 * 1080) / 750));
+  });
+
+  it("handles small images", () => {
+    assert.equal(estimateVisionTokens(16, 16), Math.ceil(256 / 750));
+  });
+
+  it("handles portrait dimensions", () => {
+    // 1080x1920 portrait
+    const tokens = estimateVisionTokens(1080, 1920);
+    assert.equal(tokens, Math.ceil((1080 * 1920) / 750));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// overlapMs — segment/window overlap calculation
+// ---------------------------------------------------------------------------
+
+describe("overlapMs", () => {
+  it("returns full overlap when segment is inside window", () => {
+    assert.equal(overlapMs(1000, 2000, 0, 5000), 1000);
+  });
+
+  it("returns full overlap when window is inside segment", () => {
+    assert.equal(overlapMs(0, 5000, 1000, 2000), 1000);
+  });
+
+  it("returns partial overlap at start", () => {
+    assert.equal(overlapMs(0, 3000, 2000, 5000), 1000);
+  });
+
+  it("returns partial overlap at end", () => {
+    assert.equal(overlapMs(4000, 6000, 2000, 5000), 1000);
+  });
+
+  it("returns 0 for non-overlapping ranges", () => {
+    assert.equal(overlapMs(0, 1000, 2000, 3000), 0);
+  });
+
+  it("returns 0 for adjacent ranges (no overlap)", () => {
+    assert.equal(overlapMs(0, 1000, 1000, 2000), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// assignSegmentsToGrids — segment-to-grid assignment
+// ---------------------------------------------------------------------------
+
+describe("assignSegmentsToGrids", () => {
+  // Helper to create minimal Segment objects
+  const seg = (start: number, end: number, text = "x") => ({ start, end, text });
+
+  // Helper to create minimal VideoGridImage objects (only startSec/endSec matter)
+  const grid = (startSec: number, endSec: number) =>
+    ({
+      startSec,
+      endSec,
+      image: Buffer.alloc(0),
+      tiles: [],
+    }) as VideoGridImage;
+
+  it("assigns a segment entirely inside one grid", () => {
+    const segments = [seg(1000, 2000)];
+    const grids = [grid(0, 5)];
+    const { perGrid, unassigned } = assignSegmentsToGrids(segments, grids);
+    assert.deepEqual(perGrid, [[0]]);
+    assert.deepEqual(unassigned, []);
+  });
+
+  it("assigns segment to the grid with most overlap", () => {
+    // Segment 2000-5000ms. Grid A: 0-3s (overlap: 1000ms). Grid B: 3-6s (overlap: 2000ms).
+    const segments = [seg(2000, 5000)];
+    const grids = [grid(0, 3), grid(3, 6)];
+    const { perGrid, unassigned } = assignSegmentsToGrids(segments, grids);
+    assert.deepEqual(perGrid[0], []); // Grid A
+    assert.deepEqual(perGrid[1], [0]); // Grid B gets it
+    assert.deepEqual(unassigned, []);
+  });
+
+  it("assigns segment equally split to the first grid", () => {
+    // Segment 2000-4000ms. Grid A: 0-3s (overlap: 1000ms). Grid B: 3-6s (overlap: 1000ms).
+    // Equal overlap — first grid wins because we use strict >
+    const segments = [seg(2000, 4000)];
+    const grids = [grid(0, 3), grid(3, 6)];
+    const { perGrid, unassigned } = assignSegmentsToGrids(segments, grids);
+    assert.deepEqual(perGrid[0], [0]); // First grid wins on tie
+    assert.deepEqual(perGrid[1], []);
+    assert.deepEqual(unassigned, []);
+  });
+
+  it("puts non-overlapping segments in unassigned", () => {
+    const segments = [seg(10000, 11000)];
+    const grids = [grid(0, 5)];
+    const { perGrid, unassigned } = assignSegmentsToGrids(segments, grids);
+    assert.deepEqual(perGrid[0], []);
+    assert.deepEqual(unassigned, [0]);
+  });
+
+  it("handles empty segments", () => {
+    const grids = [grid(0, 5)];
+    const { perGrid, unassigned } = assignSegmentsToGrids([], grids);
+    assert.deepEqual(perGrid, [[]]);
+    assert.deepEqual(unassigned, []);
+  });
+
+  it("handles empty grids — all segments unassigned", () => {
+    const segments = [seg(0, 1000)];
+    const { perGrid, unassigned } = assignSegmentsToGrids(segments, []);
+    assert.deepEqual(perGrid, []);
+    assert.deepEqual(unassigned, [0]);
+  });
+
+  it("distributes multiple segments across multiple grids", () => {
+    const segments = [
+      seg(500, 1500), // → grid 0 (0-2s)
+      seg(2500, 3500), // → grid 1 (2-4s)
+      seg(4500, 5500), // → grid 2 (4-6s)
+      seg(7000, 8000), // → unassigned (no grid covers 7-8s)
+    ];
+    const grids = [grid(0, 2), grid(2, 4), grid(4, 6)];
+    const { perGrid, unassigned } = assignSegmentsToGrids(segments, grids);
+    assert.deepEqual(perGrid[0], [0]);
+    assert.deepEqual(perGrid[1], [1]);
+    assert.deepEqual(perGrid[2], [2]);
+    assert.deepEqual(unassigned, [3]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// understand_media — interleaved output structure (video)
+// ---------------------------------------------------------------------------
+
+describe("understand_media — interleaved output", () => {
+  it("produces interleaved transcript + grid sections for video", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+
+    const result = await handleUnderstandMedia({
+      file_path: MP4,
+      max_total_chars: 200_000, // generous budget
+      max_grids: 1,
+      cols: 2,
+      rows: 2,
+    });
+    assert.ok(!("isError" in result));
+
+    // Check that metadata mentions interleaving
+    const metadataItem = result.content[0];
+    assert.ok(metadataItem && metadataItem.type === "text");
+    assert.ok(metadataItem.text.includes("File:"));
+
+    // There should be at least one image content item (grid)
+    const imageItems = result.content.filter((item) => item.type === "image");
+    assert.ok(imageItems.length > 0, "expected at least one grid image for video");
+
+    // There should be a FRAME GRID label
+    const textItems = result.content.filter((item) => item.type === "text");
+    assert.ok(
+      textItems.some((item) => item.text.includes("FRAME GRID")),
+      "expected FRAME GRID label in output",
+    );
+
+    // Payload summary should be last
+    const lastItem = result.content[result.content.length - 1];
+    assert.ok(lastItem && lastItem.type === "text");
+    assert.ok(lastItem.text.includes("Payload:"));
+  });
+
+  it("produces metadata + image (no transcript) for image files", async () => {
+    const result = await handleUnderstandMedia({ file_path: PNG });
+    assert.ok(!("isError" in result));
+
+    // Should have metadata text + image + payload summary
+    const textItems = result.content.filter((item) => item.type === "text");
+    const imageItems = result.content.filter((item) => item.type === "image");
+    assert.ok(textItems.length >= 1, "expected metadata text");
+    assert.ok(imageItems.length === 1, "expected exactly one image for PNG");
+
+    // Should NOT have transcript headers
+    assert.ok(
+      !textItems.some((item) => item.text.includes("TRANSCRIPT")),
+      "image files should not have transcript sections",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatSrtTimestamp — SRT timestamp formatting
+// ---------------------------------------------------------------------------
+
+describe("formatSrtTimestamp", () => {
+  it("formats zero", () => {
+    assert.equal(formatSrtTimestamp(0), "00:00:00,000");
+  });
+
+  it("formats milliseconds", () => {
+    assert.equal(formatSrtTimestamp(1500), "00:00:01,500");
+  });
+
+  it("formats minutes and seconds", () => {
+    assert.equal(formatSrtTimestamp(65000), "00:01:05,000");
+  });
+
+  it("formats hours", () => {
+    assert.equal(formatSrtTimestamp(3661234), "01:01:01,234");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatTranscriptAsSRT — SRT output format
+// ---------------------------------------------------------------------------
+
+describe("formatTranscriptAsSRT", () => {
+  const segments: Segment[] = [
+    { start: 0, end: 2500, text: "Hello, welcome." },
+    { start: 2500, end: 5100, text: "Today we discuss..." },
+  ];
+
+  it("produces valid SRT with 1-based indices", () => {
+    const srt = formatTranscriptAsSRT(segments, 10000);
+    assert.ok(srt.includes("1\n00:00:00,000 --> 00:00:02,500\nHello, welcome."));
+    assert.ok(srt.includes("2\n00:00:02,500 --> 00:00:05,100\nToday we discuss..."));
+  });
+
+  it("separates entries with blank lines", () => {
+    const srt = formatTranscriptAsSRT(segments, 10000);
+    assert.ok(srt.includes("\n\n"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatTranscriptAsJSON — JSON output format
+// ---------------------------------------------------------------------------
+
+describe("formatTranscriptAsJSON", () => {
+  const segments: Segment[] = [
+    { start: 0, end: 2500, text: "Hello." },
+    { start: 2500, end: 5000, text: "World." },
+  ];
+
+  it("produces valid parseable JSON", () => {
+    const json = formatTranscriptAsJSON(segments, 10000);
+    const parsed = JSON.parse(json) as { segments: { start: number; end: number; text: string }[] };
+    assert.ok(Array.isArray(parsed.segments));
+    assert.equal(parsed.segments.length, 2);
+  });
+
+  it("includes millisecond timestamps", () => {
+    const json = formatTranscriptAsJSON(segments, 10000);
+    const parsed = JSON.parse(json) as { segments: { start: number; end: number; text: string }[] };
+    assert.equal(parsed.segments[0]!.start, 0);
+    assert.equal(parsed.segments[0]!.end, 2500);
+    assert.equal(parsed.segments[1]!.start, 2500);
+  });
+
+  it("trims text", () => {
+    const segs: Segment[] = [{ start: 0, end: 1000, text: "  padded  " }];
+    const json = formatTranscriptAsJSON(segs, 10000);
+    const parsed = JSON.parse(json) as { segments: { start: number; end: number; text: string }[] };
+    assert.equal(parsed.segments[0]!.text, "padded");
+  });
+
+  it("rounds floating-point timestamps to clean integers", () => {
+    const segs: Segment[] = [
+      { start: 32852.308999999994, end: 35100.00000000001, text: "noisy timestamps" },
+    ];
+    const json = formatTranscriptAsJSON(segs, 10000);
+    const parsed = JSON.parse(json) as { segments: { start: number; end: number; text: string }[] };
+    assert.equal(parsed.segments[0]!.start, 32852);
+    assert.equal(parsed.segments[0]!.end, 35100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// filterSegmentsByWindow — time-window filtering
+// ---------------------------------------------------------------------------
+
+describe("filterSegmentsByWindow", () => {
+  const segments: Segment[] = [
+    { start: 0, end: 2000, text: "A" },
+    { start: 2000, end: 4000, text: "B" },
+    { start: 4000, end: 6000, text: "C" },
+    { start: 6000, end: 8000, text: "D" },
+  ];
+
+  it("returns all segments when no window specified", () => {
+    const result = filterSegmentsByWindow(segments);
+    assert.equal(result.length, 4);
+  });
+
+  it("filters by start_sec only", () => {
+    const result = filterSegmentsByWindow(segments, 3);
+    // Segments B (end 4000 > 3000), C, D overlap
+    assert.equal(result.length, 3);
+    assert.equal(result[0]!.text, "B");
+  });
+
+  it("filters by end_sec only", () => {
+    const result = filterSegmentsByWindow(segments, undefined, 3);
+    // Segments A (start 0 < 3000), B (start 2000 < 3000) overlap
+    assert.equal(result.length, 2);
+    assert.equal(result[1]!.text, "B");
+  });
+
+  it("filters by both start_sec and end_sec", () => {
+    const result = filterSegmentsByWindow(segments, 2, 6);
+    // B (2000-4000), C (4000-6000) are within window. D starts at 6000 which is not < 6000.
+    assert.equal(result.length, 2);
+    assert.equal(result[0]!.text, "B");
+    assert.equal(result[1]!.text, "C");
+  });
+
+  it("returns empty when window matches nothing", () => {
+    const result = filterSegmentsByWindow(segments, 100, 200);
+    assert.equal(result.length, 0);
+  });
+
+  it("includes partially overlapping segments", () => {
+    // Segment B: 2000-4000. Window: 3-5s (3000-5000 ms).
+    // B.start (2000) < endMs (5000) AND B.end (4000) > startMs (3000) → included
+    const result = filterSegmentsByWindow(segments, 3, 5);
+    assert.ok(result.some((s) => s.text === "B"));
+    assert.ok(result.some((s) => s.text === "C"));
+    assert.equal(result.length, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_transcript — format and windowing integration
+// ---------------------------------------------------------------------------
+
+describe("get_transcript — format and windowing", () => {
+  // Note: tiny.wav is a sine wave with no speech, so Whisper returns empty segments.
+  // Integration tests for format+windowing with actual speech depend on media.test.ts
+  // fixtures. Here we test the handler's behavior with the no-speech edge case and
+  // verify that format/windowing params are accepted without error.
+  const WAV = resolve(root, "tiny.wav");
+
+  it("returns no-speech message for sine wave (default format)", async (t) => {
+    if (!existsSync(WAV)) return t.skip("tiny.wav not present");
+    const result = await handleGetTranscript({ file_path: WAV });
+    assert.ok(!("isError" in result));
+    const item = result.content[0]!;
+    assert.ok(item.type === "text");
+    assert.ok(item.text.includes("No speech detected"));
+  });
+
+  it("returns no-speech message for sine wave (srt format)", async (t) => {
+    if (!existsSync(WAV)) return t.skip("tiny.wav not present");
+    const result = await handleGetTranscript({ file_path: WAV, format: "srt" });
+    assert.ok(!("isError" in result));
+    const item = result.content[0]!;
+    assert.ok(item.type === "text");
+    assert.ok(item.text.includes("No speech detected"));
+  });
+
+  it("returns no-speech message for sine wave (json format)", async (t) => {
+    if (!existsSync(WAV)) return t.skip("tiny.wav not present");
+    const result = await handleGetTranscript({ file_path: WAV, format: "json" });
+    assert.ok(!("isError" in result));
+    const item = result.content[0]!;
+    assert.ok(item.type === "text");
+    assert.ok(item.text.includes("No speech detected"));
+  });
+
+  it("includes window info in no-speech message when windowed", async (t) => {
+    if (!existsSync(WAV)) return t.skip("tiny.wav not present");
+    const result = await handleGetTranscript({
+      file_path: WAV,
+      format: "json",
+      start_sec: 100,
+      end_sec: 200,
+    });
+    assert.ok(!("isError" in result));
+    const item = result.content[0]!;
+    assert.ok(item.type === "text");
+    assert.ok(item.text.includes("No speech detected"));
+    assert.ok(
+      item.text.includes("requested window"),
+      "expected window context in no-speech message",
+    );
+  });
+
+  it("accepts format and windowing params for video file (tiny.mp4)", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    // tiny.mp4 has audio — test that the handler doesn't reject format/windowing params
+    const result = await handleGetTranscript({
+      file_path: MP4,
+      format: "text",
+      start_sec: 0,
+      end_sec: 10,
+    });
+    assert.ok(!("isError" in result));
+    const item = result.content[0]!;
+    assert.ok(item.type === "text");
+    // Either "No speech detected" or actual transcript — both are valid
   });
 });

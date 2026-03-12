@@ -37,25 +37,21 @@ safe to call on dozens of files at once.
 Use this FIRST to scan a directory or batch of files, then pick individual files
 for heavy analysis with understand_media, get_transcript, or get_video_grids.
 
-Accepts exactly one of file_path, file_paths, or glob. Default limit is 50 files
+Accepts a single \`paths\` parameter: a string or array of strings. Each string
+can be a literal file path or a glob pattern. Default limit is 50 files
 (absolute max 200).
 
 Examples:
-  { "file_path": "/path/to/video.mp4" }
-  { "file_paths": ["/path/to/a.mp4", "/path/to/b.mp3"] }
-  { "glob": "media/**/*.{mp4,mp3,wav}" }
-  { "glob": "recordings/*.mp4", "max_files": 100 }`,
+  { "paths": "/path/to/video.mp4" }
+  { "paths": ["/path/to/a.mp4", "/path/to/b.mp3"] }
+  { "paths": "media/**/*.{mp4,mp3,wav}" }
+  { "paths": ["recordings/*.mp4", "specific/file.mp3"], "max_files": 100 }`,
     inputSchema: z.object({
-      file_path: z.string().optional().describe("Single absolute or relative media file path."),
-      file_paths: z
-        .array(z.string())
-        .min(1)
-        .optional()
-        .describe("Explicit list of media file paths to probe."),
-      glob: z
-        .string()
-        .optional()
-        .describe("Glob pattern to match media files, e.g. `media/**/*.mp4`."),
+      paths: z
+        .union([z.string(), z.array(z.string()).min(1)])
+        .describe(
+          "One or more file paths or glob patterns. Each string can be a literal path or a glob pattern (e.g. `media/**/*.mp4`). Pass a single string or an array.",
+        ),
       max_files: z
         .number()
         .int()
@@ -110,7 +106,7 @@ Examples:
         .positive()
         .optional()
         .describe(
-          "Hard cap for the entire MCP response, including text and base64 images (default 32000).",
+          "Hard cap for the entire MCP response, including text and base64 images (default 48000).",
         ),
       max_grids: z
         .number()
@@ -156,14 +152,22 @@ Examples:
         .min(1)
         .max(8)
         .optional()
-        .describe("Grid columns per tile (default 4)."),
-      rows: z.number().int().min(1).max(8).optional().describe("Grid rows per tile (default 4)."),
+        .describe("Grid columns per tile (default 4; portrait video defaults to 3 when omitted)."),
+      rows: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Grid rows per tile (default 4; portrait video defaults to 3 when omitted)."),
       thumb_width: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Thumbnail width in pixels per cell (default 480)."),
+        .describe(
+          "Thumbnail width in pixels per cell (default 480; portrait video defaults to 120 when omitted).",
+        ),
     }),
   },
   handleUnderstandMedia,
@@ -193,7 +197,7 @@ Examples:
         .positive()
         .optional()
         .describe(
-          "Hard cap for the entire MCP response, including text and base64 images (default 32000).",
+          "Hard cap for the entire MCP response, including text and base64 images (default 48000).",
         ),
       max_grids: z
         .number()
@@ -245,8 +249,20 @@ Examples:
         .positive()
         .optional()
         .describe("Spacing between composite overview grids, in seconds."),
-      cols: z.number().int().min(1).max(8).optional().describe("Grid columns (default 4)."),
-      rows: z.number().int().min(1).max(8).optional().describe("Grid rows (default 4)."),
+      cols: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Grid columns (default 4; portrait video defaults to 3 when omitted)."),
+      rows: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Grid rows (default 4; portrait video defaults to 3 when omitted)."),
       aspect_mode: z
         .enum(["contain", "cover"])
         .optional()
@@ -256,7 +272,9 @@ Examples:
         .int()
         .positive()
         .optional()
-        .describe("Thumbnail width per cell in pixels (default 480)."),
+        .describe(
+          "Thumbnail width per cell in pixels (default 480; portrait video defaults to 120 when omitted).",
+        ),
     }),
   },
   handleGetVideoGrids,
@@ -284,7 +302,7 @@ Examples:
         .positive()
         .optional()
         .describe(
-          "Hard cap for the entire MCP response, including text and base64 images (default 32000).",
+          "Hard cap for the entire MCP response, including text and base64 images (default 48000).",
         ),
       timestamps: z
         .array(z.number().nonnegative())
@@ -304,10 +322,22 @@ server.registerTool(
 Uses OpenAI's Whisper (via whisper.cpp). The model auto-downloads on first use
 (~57 MB for base.en-q5_1). Transcript is cached per file for the process lifetime.
 
-Returns plain text with segment timestamps on each line: "[start–end] text"
+Three output formats:
+- "text" (default): timestamped lines — "[start–end] text" per segment
+- "srt": standard SRT subtitle format (1-based index, HH:MM:SS,mmm timestamps)
+- "json": machine-readable JSON with millisecond-precision segment timestamps
+
+Optional time windowing with start_sec/end_sec filters the output segments
+(transcription still processes the full file, but results are cached).
+
+Two-step workflow for long media:
+1. Overview: get_transcript(file, { format: "srt" }) — scan for topics/transitions
+2. Detail: get_transcript(file, { format: "json", start_sec: 120, end_sec: 300 }) — precise data for a specific range
 
 Examples:
   { "file_path": "/path/to/podcast.mp3" }
+  { "file_path": "/path/to/meeting.mp4", "format": "srt" }
+  { "file_path": "/path/to/episode.mp3", "format": "json", "start_sec": 60, "end_sec": 120 }
   { "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to an audio or video file."),
@@ -323,6 +353,26 @@ Examples:
         .positive()
         .optional()
         .describe("Max characters to return (default 32000). Keeps first 60% + last 40%."),
+      format: z
+        .enum(["text", "srt", "json"])
+        .optional()
+        .describe(
+          'Output format. "text" (default): timestamped lines. "srt": SRT subtitles. "json": machine-readable with ms timestamps.',
+        ),
+      start_sec: z
+        .number()
+        .nonnegative()
+        .optional()
+        .describe(
+          "Filter output to segments starting at or after this time. Transcription still covers the full file (cached).",
+        ),
+      end_sec: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Filter output to segments ending at or before this time. Transcription still covers the full file (cached).",
+        ),
     }),
   },
   handleGetTranscript,
