@@ -33,6 +33,7 @@
   },
   "files": [
     "dist",
+    "scripts",
     "README.md",
     "LICENSE"
   ],
@@ -44,7 +45,7 @@
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
     "check-all": "pnpm run format:check && pnpm run lint && pnpm run typecheck",
-    "postinstall": "node node_modules/node-av/dist/ffmpeg/install.js",
+    "postinstall": "node scripts/install-node-av.mjs && node scripts/download-whisper-model.mjs",
     "test": "node --test dist/tests/*.test.js",
     "pretest": "tsc",
     "prepublishOnly": "pnpm run check-all && pnpm run build"

@@ -30,7 +30,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: SKIP_MODEL_DOWNLOAD=1 pnpm install --frozen-lockfile
 
       - name: Generate test fixtures
         run: |

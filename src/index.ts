@@ -8,6 +8,8 @@
 export {
   compressForLLM,
   extractFrame,
+  extractFrameGridImages,
+  extractFrameImage,
   extractFrameGrid,
   probeMedia,
   resolveModelDir,
@@ -16,6 +18,14 @@ export {
   understandMedia,
 } from "./media.js";
 
+export {
+  handleGetFrames,
+  handleGetTranscript,
+  handleGetVideoGrids,
+  handleProbeMedia,
+  handleUnderstandMedia,
+} from "./mcp-handlers.js";
+
 export type {
   GridOptions,
   MediaInfo,
@@ -23,6 +33,9 @@ export type {
   Segment,
   TranscribeOptions,
   UnderstandResult,
+  VideoFrameImage,
+  VideoGridImage,
+  VideoGridTile,
 } from "./types.js";
 
 export { MediaError } from "./types.js";

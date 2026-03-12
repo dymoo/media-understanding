@@ -1,0 +1,42 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="720" fill="#F6F1E8"/>
+  <rect x="40" y="40" width="1120" height="640" rx="28" fill="#FFFDF9" stroke="#D8CCBC" stroke-width="2"/>
+  <text x="80" y="100" fill="#2C241C" font-family="Georgia, serif" font-size="38" font-weight="700">How media-understanding works</text>
+  <text x="80" y="138" fill="#6F5F4D" font-family="Menlo, monospace" font-size="18">One call can return metadata, transcript text, and timestamped video overview images.</text>
+
+  <rect x="80" y="180" width="300" height="440" rx="24" fill="#FBF6EE" stroke="#D7C9B7" stroke-width="2"/>
+  <text x="112" y="228" fill="#2C241C" font-family="Georgia, serif" font-size="28" font-weight="700">1. Input media</text>
+  <rect x="112" y="270" width="236" height="82" rx="16" fill="#E9DED0"/>
+  <text x="132" y="320" fill="#2C241C" font-family="Menlo, monospace" font-size="20">video.mp4</text>
+  <rect x="112" y="380" width="236" height="82" rx="16" fill="#E2EAF1"/>
+  <text x="132" y="430" fill="#243341" font-family="Menlo, monospace" font-size="20">podcast.mp3</text>
+  <rect x="112" y="490" width="236" height="82" rx="16" fill="#E8E2F1"/>
+  <text x="132" y="540" fill="#312746" font-family="Menlo, monospace" font-size="20">image.png</text>
+
+  <rect x="450" y="180" width="300" height="440" rx="24" fill="#FBF6EE" stroke="#D7C9B7" stroke-width="2"/>
+  <text x="482" y="228" fill="#2C241C" font-family="Georgia, serif" font-size="28" font-weight="700">2. Processing</text>
+  <text x="482" y="290" fill="#6F5F4D" font-family="Menlo, monospace" font-size="18">- probe metadata</text>
+  <text x="482" y="328" fill="#6F5F4D" font-family="Menlo, monospace" font-size="18">- transcribe audio when present</text>
+  <text x="482" y="366" fill="#6F5F4D" font-family="Menlo, monospace" font-size="18">- sample video frames uniformly</text>
+  <text x="482" y="404" fill="#6F5F4D" font-family="Menlo, monospace" font-size="18">- overlay exact timestamps</text>
+  <text x="482" y="442" fill="#6F5F4D" font-family="Menlo, monospace" font-size="18">- enforce max_total_chars</text>
+  <rect x="482" y="490" width="236" height="82" rx="16" fill="#2C241C"/>
+  <text x="508" y="528" fill="#FFF7EC" font-family="Menlo, monospace" font-size="18">understand_media</text>
+  <text x="508" y="554" fill="#DCCFBF" font-family="Menlo, monospace" font-size="14">single file or tiny batch</text>
+
+  <rect x="820" y="180" width="300" height="440" rx="24" fill="#FBF6EE" stroke="#D7C9B7" stroke-width="2"/>
+  <text x="852" y="228" fill="#2C241C" font-family="Georgia, serif" font-size="28" font-weight="700">3. LLM-ready output</text>
+  <rect x="852" y="272" width="236" height="150" rx="16" fill="#1D2730"/>
+  <text x="872" y="306" fill="#B8FFD3" font-family="Menlo, monospace" font-size="16">File: video.mp4</text>
+  <text x="872" y="334" fill="#B8FFD3" font-family="Menlo, monospace" font-size="16">Type: video</text>
+  <text x="872" y="362" fill="#B8FFD3" font-family="Menlo, monospace" font-size="16">Duration: 58.3s</text>
+  <text x="872" y="390" fill="#B8FFD3" font-family="Menlo, monospace" font-size="16">Transcript + timestamped grids</text>
+  <rect x="852" y="458" width="110" height="70" rx="14" fill="#D8A15B"/>
+  <rect x="978" y="458" width="110" height="70" rx="14" fill="#A95C46"/>
+  <text x="873" y="497" fill="#FFF9F0" font-family="Menlo, monospace" font-size="12">00:00:12.400</text>
+  <text x="998" y="497" fill="#FFF9F0" font-family="Menlo, monospace" font-size="12">00:00:24.800</text>
+  <text x="852" y="578" fill="#6F5F4D" font-family="Menlo, monospace" font-size="16">Text + separate images in one turn</text>
+
+  <path d="M390 400H430" stroke="#C08C52" stroke-width="6" stroke-linecap="round"/>
+  <path d="M760 400H800" stroke="#C08C52" stroke-width="6" stroke-linecap="round"/>
+</svg>

@@ -47,7 +47,7 @@ if (values.help || positionals.length === 0) {
     `Usage: media-understanding <file> [options]
 
 Options:
-  -m, --model <name>      Whisper model (default: tiny.en)
+  -m, --model <name>      Whisper model (default: base.en-q5_1)
   --max-chars <n>         Max transcript characters (default: 32000)
   -h, --help              Show this help
   -V, --version           Print version number

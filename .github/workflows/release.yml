@@ -1,12 +1,12 @@
-name: Release Verification
+name: Release
 
 on:
   release:
     types: [published]
 
 jobs:
-  verify-release:
-    name: Verify release build
+  verify-and-publish:
+    name: Verify + publish to npm
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,9 +24,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: SKIP_MODEL_DOWNLOAD=1 pnpm install --frozen-lockfile
 
       - name: Run check-all (format + lint + typecheck)
         run: pnpm run check-all
@@ -36,3 +37,8 @@ jobs:
 
       - name: Build
         run: pnpm run build
+
+      - name: Publish to npm
+        run: pnpm publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -4,7 +4,7 @@
 
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, open, readdir, rm, stat } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -21,6 +21,9 @@ import type {
   ProcessOptions,
   Segment,
   TranscribeOptions,
+  VideoFrameImage,
+  VideoGridImage,
+  VideoGridTile,
   UnderstandResult,
 } from "./types.js";
 import { MediaError } from "./types.js";
@@ -50,6 +53,38 @@ const IMAGE_EXTENSIONS_FALLBACK = new Set([
   ".rw2",
   ".psd",
 ]);
+
+const DEFAULT_SCENE_THRESHOLD = 0.3;
+const DEFAULT_FRAME_INTERVAL = 300;
+const DEFAULT_COLS = 4;
+const DEFAULT_ROWS = 4;
+const DEFAULT_THUMB_WIDTH = 480;
+const DEFAULT_ASPECT_MODE = "contain" as const;
+const DEFAULT_SAMPLING_STRATEGY = "uniform" as const;
+const OVERLAY_BANNER_HEIGHT = 34;
+const OVERLAY_FONT_SIZE = 20;
+const OVERLAY_PADDING = 8;
+
+interface NormalizedGridOptions {
+  maxGrids: number;
+  startSec: number;
+  endSec: number;
+  samplingStrategy: "uniform" | "scene";
+  sceneThreshold: number;
+  frameInterval: number;
+  secondsPerFrame: number | undefined;
+  secondsPerGrid: number | undefined;
+  cols: number;
+  rows: number;
+  thumbWidth: number;
+  aspectMode: "contain" | "cover";
+}
+
+interface PlannedGridWindow {
+  startSec: number;
+  endSec: number;
+  timestampsSec: number[];
+}
 
 /**
  * Classify a file by content (magic bytes first, extension fallback).
@@ -113,15 +148,15 @@ function assertFfmpeg(): void {
   }
 }
 
-/** Resolve absolute path and assert the file exists. */
-async function assertFile(filePath: string): Promise<string> {
+/** Resolve absolute path, assert the file exists, and return path + size. */
+async function assertFile(filePath: string): Promise<{ abs: string; size: number }> {
   const abs = resolve(filePath);
   try {
-    await stat(abs);
+    const s = await stat(abs);
+    return { abs, size: s.size };
   } catch {
     throw new MediaError("FILE_NOT_FOUND", `File not found: ${abs}`);
   }
-  return abs;
 }
 
 const HASH_SAMPLE_BYTES = 64 * 1024; // 64 KB
@@ -163,6 +198,223 @@ export function truncateTranscript(text: string, maxChars: number): string {
   return text.slice(0, keep1) + "\n\n[…transcript truncated…]\n\n" + text.slice(-keep2);
 }
 
+function formatTimestamp(timestampSec: number): string {
+  const totalMs = Math.max(0, Math.round(timestampSec * 1000));
+  const hours = Math.floor(totalMs / 3_600_000);
+  const minutes = Math.floor((totalMs % 3_600_000) / 60_000);
+  const seconds = Math.floor((totalMs % 60_000) / 1000);
+  const millis = totalMs % 1000;
+
+  return `${hours.toString().padStart(2, "0")}:${minutes
+    .toString()
+    .padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${millis
+    .toString()
+    .padStart(3, "0")}`;
+}
+
+function escapeSvgText(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+async function addTimestampOverlay(
+  input: Buffer,
+  label: string,
+  widthHint?: number,
+): Promise<Buffer> {
+  const meta = await sharp(input).metadata();
+  const width = meta.width ?? widthHint ?? DEFAULT_THUMB_WIDTH;
+  const height = meta.height ?? Math.round((width * 9) / 16);
+  const safeLabel = escapeSvgText(label);
+
+  const svg = Buffer.from(`
+    <svg width="${width}" height="${OVERLAY_BANNER_HEIGHT}" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="0" width="${width}" height="${OVERLAY_BANNER_HEIGHT}" fill="rgba(0,0,0,0.82)" />
+      <text
+        x="${width - OVERLAY_PADDING}"
+        y="${Math.round(OVERLAY_BANNER_HEIGHT / 2) + Math.round(OVERLAY_FONT_SIZE / 3)}"
+        text-anchor="end"
+        font-family="Menlo, Monaco, Consolas, monospace"
+        font-size="${OVERLAY_FONT_SIZE}"
+        fill="#ffffff"
+      >${safeLabel}</text>
+    </svg>
+  `);
+
+  return sharp({
+    create: {
+      width,
+      height: height + OVERLAY_BANNER_HEIGHT,
+      channels: 3,
+      background: { r: 0, g: 0, b: 0 },
+    },
+  })
+    .composite([
+      { input, left: 0, top: 0 },
+      { input: svg, left: 0, top: height },
+    ])
+    .jpeg({ quality: 85 })
+    .toBuffer();
+}
+
+function normalizeGridOptions(opts: GridOptions, durationSec: number): NormalizedGridOptions {
+  const maxGrids =
+    opts.maxGrids ?? parseInt(process.env["MEDIA_UNDERSTANDING_MAX_GRIDS"] ?? "6", 10);
+  const startSec = opts.startSec ?? 0;
+  const endSec = Math.min(opts.endSec ?? durationSec, durationSec);
+  const samplingStrategy = opts.samplingStrategy ?? DEFAULT_SAMPLING_STRATEGY;
+  const sceneThreshold = opts.sceneThreshold ?? DEFAULT_SCENE_THRESHOLD;
+  const frameInterval = opts.frameInterval ?? DEFAULT_FRAME_INTERVAL;
+  const cols = opts.cols ?? DEFAULT_COLS;
+  const rows = opts.rows ?? DEFAULT_ROWS;
+  const thumbWidth = opts.thumbWidth ?? DEFAULT_THUMB_WIDTH;
+  const aspectMode = opts.aspectMode ?? DEFAULT_ASPECT_MODE;
+
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new MediaError("INVALID_SAMPLING", "Video duration must be greater than 0.");
+  }
+
+  if (maxGrids <= 0) {
+    throw new MediaError("INVALID_SAMPLING", "maxGrids must be greater than 0.");
+  }
+
+  if (startSec < 0) {
+    throw new MediaError("INVALID_SAMPLING", `startSec must be >= 0, got ${startSec}.`);
+  }
+
+  if (endSec <= startSec) {
+    throw new MediaError(
+      "INVALID_SAMPLING",
+      `endSec must be greater than startSec. Got startSec=${startSec}, endSec=${endSec}.`,
+    );
+  }
+
+  if (opts.secondsPerFrame !== undefined && opts.secondsPerFrame <= 0) {
+    throw new MediaError(
+      "INVALID_SAMPLING",
+      `secondsPerFrame must be > 0, got ${opts.secondsPerFrame}.`,
+    );
+  }
+
+  if (opts.secondsPerGrid !== undefined && opts.secondsPerGrid <= 0) {
+    throw new MediaError(
+      "INVALID_SAMPLING",
+      `secondsPerGrid must be > 0, got ${opts.secondsPerGrid}.`,
+    );
+  }
+
+  return {
+    maxGrids,
+    startSec,
+    endSec,
+    samplingStrategy,
+    sceneThreshold,
+    frameInterval,
+    secondsPerFrame: opts.secondsPerFrame,
+    secondsPerGrid: opts.secondsPerGrid,
+    cols,
+    rows,
+    thumbWidth,
+    aspectMode,
+  };
+}
+
+function buildUniformSamplingPlan(opts: NormalizedGridOptions): PlannedGridWindow[] {
+  const framesPerGrid = opts.cols * opts.rows;
+  const totalWindow = opts.endSec - opts.startSec;
+  const gridCount = opts.maxGrids;
+  const gridSpan = opts.secondsPerGrid ?? totalWindow / gridCount;
+  const frameSpan = opts.secondsPerFrame ?? gridSpan / framesPerGrid;
+
+  if (frameSpan <= 0 || gridSpan <= 0) {
+    throw new MediaError(
+      "INVALID_SAMPLING",
+      "The requested sampling settings produce zero-width frame or grid windows.",
+    );
+  }
+
+  const requiredWindow = (gridCount - 1) * gridSpan + framesPerGrid * frameSpan;
+  if (requiredWindow - totalWindow > 1e-6) {
+    throw new MediaError(
+      "INVALID_SAMPLING",
+      `Requested window ${opts.startSec.toFixed(3)}s-${opts.endSec.toFixed(3)}s is too short for ${gridCount} grid(s) at seconds_per_grid=${gridSpan.toFixed(3)} and seconds_per_frame=${frameSpan.toFixed(3)}. Increase seconds_per_grid, increase seconds_per_frame, reduce max_grids, or shorten the number of frames per grid.`,
+    );
+  }
+
+  const slack = Math.max(0, totalWindow - requiredWindow);
+  const offset = slack / 2;
+  const windows: PlannedGridWindow[] = [];
+
+  for (let gridIndex = 0; gridIndex < gridCount; gridIndex += 1) {
+    const gridStart = opts.startSec + offset + gridIndex * gridSpan;
+    const gridEnd = Math.min(opts.endSec, gridStart + framesPerGrid * frameSpan);
+    const timestampsSec: number[] = [];
+
+    for (let frameIndex = 0; frameIndex < framesPerGrid; frameIndex += 1) {
+      const binStart = gridStart + frameIndex * frameSpan;
+      const binCenter = binStart + frameSpan / 2;
+      const safeEnd = Math.max(opts.startSec, opts.endSec - 0.001);
+      timestampsSec.push(Math.min(Math.max(binCenter, opts.startSec), safeEnd));
+    }
+
+    windows.push({ startSec: gridStart, endSec: gridEnd, timestampsSec });
+  }
+
+  return windows;
+}
+
+function buildSceneSamplingPlan(
+  opts: NormalizedGridOptions,
+  durationSec: number,
+): PlannedGridWindow[] {
+  const fps = 30;
+  const frameIntervalSec = Math.max(1 / fps, opts.frameInterval / fps);
+  const clone: NormalizedGridOptions = {
+    ...opts,
+    secondsPerFrame: opts.secondsPerFrame ?? frameIntervalSec,
+    secondsPerGrid: opts.secondsPerGrid,
+    endSec: Math.min(opts.endSec, durationSec),
+  };
+
+  return buildUniformSamplingPlan(clone);
+}
+
+function planVideoSampling(opts: NormalizedGridOptions, durationSec: number): PlannedGridWindow[] {
+  if (opts.samplingStrategy === "scene") {
+    return buildSceneSamplingPlan(opts, durationSec);
+  }
+
+  return buildUniformSamplingPlan(opts);
+}
+
+async function buildVideoFrameImage(
+  filePath: string,
+  timestampSec: number,
+  overlayPrefix?: string,
+): Promise<VideoFrameImage> {
+  const image = await extractFrame(filePath, timestampSec, overlayPrefix);
+  return {
+    image,
+    timestampSec,
+    timestampLabel: formatTimestamp(timestampSec),
+  };
+}
+
+/**
+ * Extract a single video frame and return both the image and its exact timestamp.
+ */
+export async function extractFrameImage(
+  filePath: string,
+  timestampSec: number,
+): Promise<VideoFrameImage> {
+  const { abs } = await assertFile(filePath);
+  return buildVideoFrameImage(abs, timestampSec, abs);
+}
+
 // ---------------------------------------------------------------------------
 // probeMedia
 // ---------------------------------------------------------------------------
@@ -174,7 +426,7 @@ export function truncateTranscript(text: string, maxChars: number): string {
  * Images are probed via sharp; audio/video via Demuxer.
  */
 export async function probeMedia(filePath: string): Promise<MediaInfo> {
-  const abs = await assertFile(filePath);
+  const { abs, size: fileSizeBytes } = await assertFile(filePath);
   const kind = await classifyFile(abs);
 
   if (kind === "image") {
@@ -186,6 +438,7 @@ export async function probeMedia(filePath: string): Promise<MediaInfo> {
         duration: 0,
         width: meta.width,
         height: meta.height,
+        fileSizeBytes,
       };
     } catch (err) {
       throw new MediaError("UNSUPPORTED_FORMAT", `Cannot read image: ${abs}`, err);
@@ -212,6 +465,7 @@ export async function probeMedia(filePath: string): Promise<MediaInfo> {
       path: abs,
       type,
       duration: input.duration,
+      fileSizeBytes,
     };
 
     if (videoStream) {
@@ -252,22 +506,23 @@ export async function transcribeAudio(
   opts: TranscribeOptions = {},
 ): Promise<Segment[]> {
   assertFfmpeg();
-  const abs = await assertFile(filePath);
+  const { abs } = await assertFile(filePath);
 
-  const cacheKey = await fileFingerprint(abs);
-  const cached = transcriptCache.get(cacheKey);
-  if (cached) return cached;
-
-  const modelName = opts.model ?? process.env["MEDIA_UNDERSTANDING_MODEL"] ?? "tiny.en";
+  const modelName = opts.model ?? process.env["MEDIA_UNDERSTANDING_MODEL"] ?? "base.en-q5_1";
 
   if (!WhisperDownloader.isValidModel(modelName)) {
     throw new MediaError(
       "TRANSCRIBE_FAILED",
       `Invalid Whisper model name: "${modelName}". ` +
         `Valid models: tiny, tiny.en, base, base.en, small, small.en, ` +
-        `medium, medium.en, large-v1, large-v2, large-v3, etc.`,
+        `medium, medium.en, large-v1, large-v2, large-v3, ` +
+        `tiny.en-q5_1, base.en-q5_1, small.en-q5_1, large-v3-turbo-q5_0, etc.`,
     );
   }
+
+  const cacheKey = await fileFingerprint(abs);
+  const cached = transcriptCache.get(cacheKey);
+  if (cached) return cached;
 
   const modelDir = resolveModelDir();
 
@@ -319,87 +574,58 @@ export async function extractFrameGrid(
   filePath: string,
   opts: GridOptions = {},
 ): Promise<Buffer[]> {
+  const grids = await extractFrameGridImages(filePath, opts);
+  return grids.map((grid) => grid.image);
+}
+
+/**
+ * Extract timestamped composite grid images from a video file.
+ */
+export async function extractFrameGridImages(
+  filePath: string,
+  opts: GridOptions = {},
+): Promise<VideoGridImage[]> {
   assertFfmpeg();
-  const abs = await assertFile(filePath);
+  const { abs } = await assertFile(filePath);
 
-  const maxGrids =
-    opts.maxGrids ?? parseInt(process.env["MEDIA_UNDERSTANDING_MAX_GRIDS"] ?? "6", 10);
-  const startSec = opts.startSec ?? 0;
-  const endSec = opts.endSec; // undefined = end of file
-  const sceneThreshold = opts.sceneThreshold ?? 0.3;
-  const frameInterval = opts.frameInterval ?? 300;
-  const cols = opts.cols ?? 4;
-  const rows = opts.rows ?? 4;
-  const thumbWidth = opts.thumbWidth ?? 480;
+  const info = await probeMedia(abs);
+  if (info.type !== "video") {
+    throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${abs}`);
+  }
 
-  const framesPerGrid = cols * rows;
-
-  // Build the FFmpeg filter for frame selection.
-  // select filter syntax for FFmpeg filter args (no shell, so only FFmpeg-level escaping needed).
-  const selectExpr = `gt(scene\\,${sceneThreshold})+not(mod(n\\,${frameInterval}))`;
-
-  const vf = [
-    startSec > 0
-      ? `trim=start=${startSec}${endSec !== undefined ? `:end=${endSec}` : ""},setpts=PTS-STARTPTS`
-      : endSec !== undefined
-        ? `trim=end=${endSec},setpts=PTS-STARTPTS`
-        : null,
-    `select='${selectExpr}'`,
-    `scale=${thumbWidth}:-2`,
-    `fps=fps=1/1`, // slow down to 1fps so we can use -vsync 0
-  ]
-    .filter(Boolean)
-    .join(",");
-
-  const tmpDir = await mkdtemp(join(homedir(), ".cache", "media-understanding-tmp-"));
+  const normalized = normalizeGridOptions(opts, info.duration);
+  const plans = planVideoSampling(normalized, info.duration);
 
   try {
-    const ffmpeg = ffmpegPath();
+    const grids: VideoGridImage[] = [];
+    for (const plan of plans) {
+      const frames = await Promise.all(
+        plan.timestampsSec.map((timestampSec) => buildVideoFrameImage(abs, timestampSec, abs)),
+      );
 
-    // Extract selected frames to temp dir as JPEG files
-    const args = [
-      "-i",
-      abs,
-      "-vf",
-      vf,
-      "-vsync",
-      "0",
-      "-frame_pts",
-      "1",
-      "-q:v",
-      "3",
-      join(tmpDir, "frame_%06d.jpg"),
-    ];
+      if (frames.length === 0) continue;
 
-    await execFile(ffmpeg, args, { maxBuffer: 64 * 1024 * 1024 });
-
-    // Read extracted frames
-    const files = (await readdir(tmpDir)).filter((f) => f.endsWith(".jpg")).sort();
-
-    if (files.length === 0) {
-      // No frames selected — return empty array rather than error
-      return [];
-    }
-
-    // Group frames into batches of framesPerGrid, capped at maxGrids
-    const batches: string[][] = [];
-    for (let i = 0; i < files.length && batches.length < maxGrids; i += framesPerGrid) {
-      batches.push(files.slice(i, i + framesPerGrid).map((f) => join(tmpDir, f)));
-    }
-
-    // Compose each batch into a grid using sharp
-    const grids: Buffer[] = [];
-    for (const batch of batches) {
-      const grid = await composeGrid(batch, cols, thumbWidth);
-      grids.push(await compressForLLM(grid));
+      const grid = await composeGrid(
+        frames,
+        normalized.cols,
+        normalized.thumbWidth,
+        normalized.aspectMode,
+      );
+      grids.push({
+        image: await compressForLLM(grid),
+        startSec: plan.startSec,
+        endSec: plan.endSec,
+        tiles: frames.map<VideoGridTile>((frame) => ({
+          timestampSec: frame.timestampSec,
+          timestampLabel: frame.timestampLabel,
+        })),
+      });
     }
 
     return grids;
   } catch (err) {
     if (err instanceof MediaError) throw err;
     throw new MediaError("GRID_FAILED", `Frame grid extraction failed: ${abs}`, err);
-  } finally {
-    await rm(tmpDir, { recursive: true, force: true });
   }
 }
 
@@ -408,34 +634,62 @@ export async function extractFrameGrid(
  * Arranges tiles left-to-right, top-to-bottom.
  */
 async function composeGrid(
-  framePaths: string[],
+  frames: VideoFrameImage[],
   cols: number,
   thumbWidth: number,
+  aspectMode: "contain" | "cover",
 ): Promise<Buffer> {
-  if (framePaths.length === 0) {
+  if (frames.length === 0) {
     throw new MediaError("GRID_FAILED", "No frames to compose into grid");
   }
 
-  // Read and normalize all frames to the same dimensions
+  const [firstFrame] = frames;
+  if (!firstFrame) {
+    throw new MediaError("GRID_FAILED", "No frames to compose into grid");
+  }
+
+  const firstMeta = await sharp(firstFrame.image).metadata();
+  const sourceW = firstMeta.width ?? thumbWidth;
+  const sourceH = firstMeta.height ?? Math.round((thumbWidth * 3) / 4);
+  const tileW = thumbWidth;
+  const tileH = Math.max(1, Math.round((thumbWidth * sourceH) / sourceW));
+
   const thumbs = await Promise.all(
-    framePaths.map((p) =>
-      sharp(p)
-        .resize({ width: thumbWidth, withoutEnlargement: true })
-        .jpeg({ quality: 80 })
-        .toBuffer(),
-    ),
+    frames.map(async (frame) => {
+      if (aspectMode === "cover") {
+        return sharp(frame.image)
+          .resize(tileW, tileH, { fit: "cover", position: "centre" })
+          .jpeg({ quality: 82 })
+          .toBuffer();
+      }
+
+      return sharp({
+        create: {
+          width: tileW,
+          height: tileH,
+          channels: 3,
+          background: { r: 0, g: 0, b: 0 },
+        },
+      })
+        .composite([
+          {
+            input: await sharp(frame.image)
+              .resize(tileW, tileH, { fit: "contain", background: { r: 0, g: 0, b: 0 } })
+              .jpeg({ quality: 82 })
+              .toBuffer(),
+            left: 0,
+            top: 0,
+          },
+        ])
+        .jpeg({ quality: 82 })
+        .toBuffer();
+    }),
   );
 
-  // Get dimensions from first frame
-  const firstMeta = await sharp(thumbs[0]).metadata();
-  const tileW = firstMeta.width ?? thumbWidth;
-  const tileH = firstMeta.height ?? Math.round((thumbWidth * 9) / 16);
-
-  const rows = Math.ceil(framePaths.length / cols);
+  const rows = Math.ceil(frames.length / cols);
   const gridW = cols * tileW;
   const gridH = rows * tileH;
 
-  // Build composite instructions
   const compositeInputs = thumbs.map((buf, i) => ({
     input: buf,
     left: (i % cols) * tileW,
@@ -463,21 +717,31 @@ async function composeGrid(
  * Extract a single video frame at the given timestamp (seconds).
  * Returns a compressed JPEG Buffer.
  */
-export async function extractFrame(filePath: string, timestampSec: number): Promise<Buffer> {
+export async function extractFrame(
+  filePath: string,
+  timestampSec: number,
+  overlayPrefix?: string,
+): Promise<Buffer> {
   assertFfmpeg();
-  const abs = await assertFile(filePath);
+  const { abs } = await assertFile(filePath);
 
   if (timestampSec < 0) {
     throw new MediaError("FRAME_FAILED", `Timestamp must be >= 0, got: ${timestampSec}`);
   }
 
   try {
+    const info = await probeMedia(abs);
+    if (info.type !== "video") {
+      throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${abs}`);
+    }
+
+    const safeTimestamp = Math.min(timestampSec, Math.max(0, info.duration - 0.2));
     const ffmpeg = ffmpegPath();
     const args = [
-      "-ss",
-      String(timestampSec),
       "-i",
       abs,
+      "-ss",
+      String(safeTimestamp),
       "-vframes",
       "1",
       "-f",
@@ -493,10 +757,16 @@ export async function extractFrame(filePath: string, timestampSec: number): Prom
     });
 
     if (!stdout || stdout.length === 0) {
-      throw new MediaError("FRAME_FAILED", `No frame data returned at ${timestampSec}s in: ${abs}`);
+      throw new MediaError(
+        "FRAME_FAILED",
+        `No frame data returned at ${safeTimestamp}s in: ${abs}`,
+      );
     }
 
-    return compressForLLM(stdout as unknown as Buffer);
+    const compressed = await compressForLLM(stdout as unknown as Buffer);
+    const overlayLabel =
+      `${overlayPrefix ? `${overlayPrefix.split("/").at(-1) ?? overlayPrefix} ` : ""}${formatTimestamp(safeTimestamp)}`.trim();
+    return addTimestampOverlay(compressed, overlayLabel);
   } catch (err) {
     if (err instanceof MediaError) throw err;
     throw new MediaError(
@@ -519,7 +789,7 @@ export async function understandMedia(
   filePath: string,
   opts: ProcessOptions = {},
 ): Promise<UnderstandResult> {
-  const abs = await assertFile(filePath);
+  const { abs } = await assertFile(filePath);
   const info = await probeMedia(abs);
 
   const maxChars =
@@ -538,9 +808,11 @@ export async function understandMedia(
   }
 
   let grids: Buffer[] = [];
+  let gridImages: VideoGridImage[] = [];
   if (info.type === "video") {
-    grids = await extractFrameGrid(abs, opts);
+    gridImages = await extractFrameGridImages(abs, opts);
+    grids = gridImages.map((grid) => grid.image);
   }
 
-  return { info, segments, transcript, grids };
+  return { info, segments, transcript, grids, gridImages };
 }

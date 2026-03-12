@@ -1,79 +1,73 @@
 #!/usr/bin/env node
 /**
- * MCP server (stdio transport) exposing 4 tools for LLM media understanding.
+ * MCP server (stdio transport) exposing 5 tools for LLM media understanding.
  *
- * Tools:
- *  - understand_media  → full analysis: info + transcript + grids in one call
- *  - get_video_grids   → keyframe grids only (for re-inspection without re-transcribing)
- *  - get_frames        → extract individual frames at specific timestamps
- *  - get_transcript    → transcript only (text, no images)
+ * Three-tier workflow:
+ *   1. Discover — probe_media (cheap, batch-safe metadata)
+ *   2. Analyze  — understand_media / get_transcript / get_video_grids / get_frames (heavy, single-file)
+ *   3. Iterate  — use timestamps from one tool to target another
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { readFile } from "node:fs/promises";
-
 import {
-  compressForLLM,
-  extractFrame,
-  extractFrameGrid,
-  transcribeAudio,
-  understandMedia,
-} from "./media.js";
-import { MediaError } from "./types.js";
-
-// ---------------------------------------------------------------------------
-// MCP error helper
-// ---------------------------------------------------------------------------
-
-type McpErrorResult = {
-  isError: true;
-  content: [{ type: "text"; text: string }];
-};
-
-function mcpError(err: unknown): McpErrorResult {
-  let message: string;
-  if (err instanceof MediaError) {
-    message = `[${err.code}] ${err.message}`;
-  } else if (err instanceof Error) {
-    message = err.message;
-  } else {
-    message = String(err);
-  }
-  return { isError: true, content: [{ type: "text", text: message }] };
-}
-
-/**
- * Strip keys with undefined values and remove `undefined` from value types.
- * This satisfies `exactOptionalPropertyTypes` at call sites where Zod args
- * produce `T | undefined` for optional fields.
- */
-type ExactPartial<T> = { [K in keyof T]?: Exclude<T[K], undefined> };
-
-function buildOpts<T extends Record<string, unknown>>(raw: T): ExactPartial<T> {
-  const out: ExactPartial<T> = {};
-  for (const key of Object.keys(raw) as (keyof T)[]) {
-    if (raw[key] !== undefined) {
-      (out as Record<keyof T, unknown>)[key] = raw[key];
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
+  handleGetFrames,
+  handleGetTranscript,
+  handleGetVideoGrids,
+  handleProbeMedia,
+  handleUnderstandMedia,
+} from "./mcp-handlers.js";
 
 const server = new McpServer({
   name: "media-understanding",
   version: "0.1.0",
 });
 
-// ---------------------------------------------------------------------------
-// Tool: understand_media
-// ---------------------------------------------------------------------------
+server.registerTool(
+  "probe_media",
+  {
+    description: `Discover and triage media files before committing to heavy analysis.
+
+Returns metadata only: type, duration, resolution, codecs, file size. No decoding,
+no transcription, no images. Reads file headers only (~5-50ms per file), so it is
+safe to call on dozens of files at once.
+
+Use this FIRST to scan a directory or batch of files, then pick individual files
+for heavy analysis with understand_media, get_transcript, or get_video_grids.
+
+Accepts exactly one of file_path, file_paths, or glob. Default limit is 50 files
+(absolute max 200).
+
+Examples:
+  { "file_path": "/path/to/video.mp4" }
+  { "file_paths": ["/path/to/a.mp4", "/path/to/b.mp3"] }
+  { "glob": "media/**/*.{mp4,mp3,wav}" }
+  { "glob": "recordings/*.mp4", "max_files": 100 }`,
+    inputSchema: z.object({
+      file_path: z.string().optional().describe("Single absolute or relative media file path."),
+      file_paths: z
+        .array(z.string())
+        .min(1)
+        .optional()
+        .describe("Explicit list of media file paths to probe."),
+      glob: z
+        .string()
+        .optional()
+        .describe("Glob pattern to match media files, e.g. `media/**/*.mp4`."),
+      max_files: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Hard cap on matched files (default 50, absolute max 200). Probe is lightweight so generous limits are safe.",
+        ),
+    }),
+  },
+  handleProbeMedia,
+);
 
 server.registerTool(
   "understand_media",
@@ -89,30 +83,43 @@ Returns:
 Use this as your first call for any media file. For long videos (>10 min) or
 when you only need one modality, prefer the focused tools instead.
 
+For multiple files, use probe_media first to discover and triage, then call this
+tool once per file that needs full analysis.
+
 Examples:
   { "file_path": "/path/to/video.mp4" }
   { "file_path": "/path/to/podcast.mp3", "model": "base.en" }
   { "file_path": "/path/to/clip.mp4", "start_sec": 60, "end_sec": 120, "max_grids": 3 }`,
     inputSchema: z.object({
-      file_path: z.string().describe("Absolute or relative path to the media file."),
+      file_path: z.string().describe("Absolute or relative path to a single media file."),
       model: z
         .string()
         .optional()
         .describe(
-          'Whisper model name. Default: "tiny.en". Options: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3.',
+          'Whisper model name. Default: "base.en-q5_1". Options: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3, tiny.en-q5_1, base.en-q5_1, small.en-q5_1, large-v3-turbo-q5_0.',
         ),
       max_chars: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Max transcript characters (default 32000). Truncates middle when exceeded."),
+        .describe("Max transcript characters within the total budget (default 32000)."),
+      max_total_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Hard cap for the entire MCP response, including text and base64 images (default 32000).",
+        ),
       max_grids: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Max grid images to return for video (default 6)."),
+        .describe(
+          "Max grid images to return for video. If omitted, the server auto-fits as many as possible within budget.",
+        ),
       start_sec: z
         .number()
         .nonnegative()
@@ -123,6 +130,26 @@ Examples:
         .positive()
         .optional()
         .describe("End offset in seconds for grid extraction (default: end of file)."),
+      sampling_strategy: z
+        .enum(["uniform", "scene"])
+        .optional()
+        .describe(
+          "Sampling strategy. `uniform` is the default and covers the whole window evenly.",
+        ),
+      seconds_per_frame: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Spacing between frames within a grid, in seconds."),
+      seconds_per_grid: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Spacing between composite overview grids, in seconds."),
+      aspect_mode: z
+        .enum(["contain", "cover"])
+        .optional()
+        .describe("How frames fit in each grid tile. `contain` keeps the full frame visible."),
       cols: z
         .number()
         .int()
@@ -139,87 +166,8 @@ Examples:
         .describe("Thumbnail width in pixels per cell (default 480)."),
     }),
   },
-  async (args) => {
-    try {
-      const result = await understandMedia(
-        args.file_path,
-        buildOpts({
-          model: args.model,
-          maxChars: args.max_chars,
-          maxGrids: args.max_grids,
-          startSec: args.start_sec,
-          endSec: args.end_sec,
-          cols: args.cols,
-          rows: args.rows,
-          thumbWidth: args.thumb_width,
-        }),
-      );
-
-      const content: Array<
-        { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
-      > = [];
-
-      // Media info summary
-      const { info } = result;
-      const lines: string[] = [
-        `File: ${info.path}`,
-        `Type: ${info.type}`,
-        `Duration: ${info.duration.toFixed(1)}s`,
-      ];
-      if (info.width) lines.push(`Resolution: ${info.width}x${info.height}`);
-      if (info.fps) lines.push(`FPS: ${info.fps.toFixed(2)}`);
-      if (info.videoCodec) lines.push(`Video codec: ${info.videoCodec}`);
-      if (info.audioCodec) lines.push(`Audio codec: ${info.audioCodec}`);
-      if (info.sampleRate) lines.push(`Sample rate: ${info.sampleRate}Hz`);
-      if (info.channels) lines.push(`Channels: ${info.channels}`);
-
-      content.push({ type: "text", text: lines.join("\n") });
-
-      // Transcript
-      if (result.transcript) {
-        content.push({
-          type: "text",
-          text: `\n--- TRANSCRIPT ---\n${result.transcript}`,
-        });
-      }
-
-      // Image (for image files)
-      if (info.type === "image") {
-        const raw = await readFile(info.path);
-        const compressed = await compressForLLM(raw);
-        content.push({
-          type: "image",
-          data: compressed.toString("base64"),
-          mimeType: "image/jpeg",
-        });
-      }
-
-      // Frame grids
-      for (let i = 0; i < result.grids.length; i++) {
-        const grid = result.grids[i];
-        if (grid) {
-          content.push({
-            type: "text",
-            text: `\n--- FRAME GRID ${i + 1}/${result.grids.length} ---`,
-          });
-          content.push({
-            type: "image",
-            data: grid.toString("base64"),
-            mimeType: "image/jpeg",
-          });
-        }
-      }
-
-      return { content };
-    } catch (err) {
-      return mcpError(err);
-    }
-  },
+  handleUnderstandMedia,
 );
-
-// ---------------------------------------------------------------------------
-// Tool: get_video_grids
-// ---------------------------------------------------------------------------
 
 server.registerTool(
   "get_video_grids",
@@ -227,21 +175,34 @@ server.registerTool(
     description: `Extract keyframe grid images from a video file.
 
 Each grid is a JPEG contact sheet of thumbnails arranged in a cols×rows tile.
-Use for visual inspection without triggering transcription.
-Ideal for re-scanning a specific time range or adjusting grid density.
+Every tile has an exact timestamp overlay, and the accompanying text lists the
+exact timestamps in row-major order.
+
+Use this for visual inspection without transcription. It is budget-aware: if
+you omit max_grids, the server returns as many grids as fit under max_total_chars.
 
 Examples:
   { "file_path": "/path/to/video.mp4" }
-  { "file_path": "/path/to/movie.mkv", "start_sec": 300, "end_sec": 600, "max_grids": 4 }
-  { "file_path": "/path/to/lecture.mp4", "scene_threshold": 0.5, "frame_interval": 150 }`,
+  { "file_path": "/path/to/movie.mkv", "start_sec": 300, "end_sec": 600, "max_grids": 2, "seconds_per_frame": 8 }
+  { "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to a video file."),
+      max_total_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Hard cap for the entire MCP response, including text and base64 images (default 32000).",
+        ),
       max_grids: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Max grid images to return (default 6)."),
+        .describe(
+          "Max grid images to return. If omitted, the server auto-fits as many as possible within budget.",
+        ),
       start_sec: z
         .number()
         .nonnegative()
@@ -252,22 +213,44 @@ Examples:
         .positive()
         .optional()
         .describe("End offset in seconds (default: end of file)."),
+      sampling_strategy: z
+        .enum(["uniform", "scene"])
+        .optional()
+        .describe(
+          "Sampling strategy. `uniform` is the default and covers the whole window evenly.",
+        ),
       scene_threshold: z
         .number()
         .min(0)
         .max(1)
         .optional()
-        .describe("Scene-change threshold 0–1. Higher = fewer keyframes. Default 0.3."),
+        .describe(
+          'Scene-change threshold 0–1. Higher = fewer keyframes. Used when sampling_strategy="scene".',
+        ),
       frame_interval: z
         .number()
         .int()
         .positive()
         .optional()
         .describe(
-          "Fallback: include a frame every N frames even without scene change (default 300 ≈ 10s at 30fps).",
+          'Fallback: include a frame every N frames even without scene change (default 300 ≈ 10s at 30fps). Used when sampling_strategy="scene".',
         ),
+      seconds_per_frame: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Spacing between frames within a grid, in seconds."),
+      seconds_per_grid: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Spacing between composite overview grids, in seconds."),
       cols: z.number().int().min(1).max(8).optional().describe("Grid columns (default 4)."),
       rows: z.number().int().min(1).max(8).optional().describe("Grid rows (default 4)."),
+      aspect_mode: z
+        .enum(["contain", "cover"])
+        .optional()
+        .describe("How frames fit in each grid tile. `contain` keeps the full frame visible."),
       thumb_width: z
         .number()
         .int()
@@ -276,62 +259,8 @@ Examples:
         .describe("Thumbnail width per cell in pixels (default 480)."),
     }),
   },
-  async (args) => {
-    try {
-      const grids = await extractFrameGrid(
-        args.file_path,
-        buildOpts({
-          maxGrids: args.max_grids,
-          startSec: args.start_sec,
-          endSec: args.end_sec,
-          sceneThreshold: args.scene_threshold,
-          frameInterval: args.frame_interval,
-          cols: args.cols,
-          rows: args.rows,
-          thumbWidth: args.thumb_width,
-        }),
-      );
-
-      if (grids.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "No keyframes found. Try lowering scene_threshold or frame_interval.",
-            },
-          ],
-        };
-      }
-
-      const content: Array<
-        { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
-      > = [{ type: "text", text: `Extracted ${grids.length} grid(s).` }];
-
-      for (let i = 0; i < grids.length; i++) {
-        const grid = grids[i];
-        if (grid) {
-          content.push({
-            type: "text",
-            text: `Grid ${i + 1}/${grids.length}`,
-          });
-          content.push({
-            type: "image",
-            data: grid.toString("base64"),
-            mimeType: "image/jpeg",
-          });
-        }
-      }
-
-      return { content };
-    } catch (err) {
-      return mcpError(err);
-    }
-  },
+  handleGetVideoGrids,
 );
-
-// ---------------------------------------------------------------------------
-// Tool: get_frames
-// ---------------------------------------------------------------------------
 
 server.registerTool(
   "get_frames",
@@ -342,12 +271,21 @@ Returns one JPEG image per requested timestamp. Useful for inspecting exact
 moments identified from a transcript or grid (e.g. "show me the frame at 1:23").
 
 Timestamps are in seconds (fractional values allowed).
+Each returned frame image includes an exact timestamp overlay.
 
 Examples:
   { "file_path": "/path/to/video.mp4", "timestamps": [0, 30, 60] }
   { "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to a video file."),
+      max_total_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Hard cap for the entire MCP response, including text and base64 images (default 32000).",
+        ),
       timestamps: z
         .array(z.number().nonnegative())
         .min(1)
@@ -355,32 +293,8 @@ Examples:
         .describe("Timestamps in seconds at which to extract frames. Max 20 per call."),
     }),
   },
-  async (args) => {
-    try {
-      const content: Array<
-        { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
-      > = [];
-
-      for (const ts of args.timestamps) {
-        content.push({ type: "text", text: `Frame at ${ts.toFixed(2)}s` });
-        const buf = await extractFrame(args.file_path, ts);
-        content.push({
-          type: "image",
-          data: buf.toString("base64"),
-          mimeType: "image/jpeg",
-        });
-      }
-
-      return { content };
-    } catch (err) {
-      return mcpError(err);
-    }
-  },
+  handleGetFrames,
 );
-
-// ---------------------------------------------------------------------------
-// Tool: get_transcript
-// ---------------------------------------------------------------------------
 
 server.registerTool(
   "get_transcript",
@@ -388,19 +302,21 @@ server.registerTool(
     description: `Transcribe an audio or video file and return the text.
 
 Uses OpenAI's Whisper (via whisper.cpp). The model auto-downloads on first use
-(~75 MB for tiny.en). Transcript is cached per file for the process lifetime.
+(~57 MB for base.en-q5_1). Transcript is cached per file for the process lifetime.
 
 Returns plain text with segment timestamps on each line: "[start–end] text"
 
 Examples:
   { "file_path": "/path/to/podcast.mp3" }
-  { "file_path": "/path/to/meeting.mp4", "model": "base.en", "max_chars": 16000 }`,
+  { "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to an audio or video file."),
       model: z
         .string()
         .optional()
-        .describe('Whisper model. Default: "tiny.en". Larger models are slower but more accurate.'),
+        .describe(
+          'Whisper model. Default: "base.en-q5_1". Larger models are slower but more accurate.',
+        ),
       max_chars: z
         .number()
         .int()
@@ -409,50 +325,8 @@ Examples:
         .describe("Max characters to return (default 32000). Keeps first 60% + last 40%."),
     }),
   },
-  async (args) => {
-    try {
-      const maxChars =
-        args.max_chars ?? parseInt(process.env["MEDIA_UNDERSTANDING_MAX_CHARS"] ?? "32000", 10);
-
-      const segments = await transcribeAudio(args.file_path, buildOpts({ model: args.model }));
-
-      if (segments.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: "No speech detected." }],
-        };
-      }
-
-      // Format: "[0.0–3.2] Hello world."
-      const formatted = segments
-        .map(
-          (s) => `[${(s.start / 1000).toFixed(1)}–${(s.end / 1000).toFixed(1)}] ${s.text.trim()}`,
-        )
-        .join("\n");
-
-      // Apply truncation
-      const raw = segments
-        .map((s) => s.text)
-        .join(" ")
-        .trim();
-      const truncated =
-        raw.length > maxChars
-          ? formatted.slice(0, Math.floor(maxChars * 0.6)) +
-            "\n\n[…transcript truncated…]\n\n" +
-            formatted.slice(-Math.floor(maxChars * 0.4))
-          : formatted;
-
-      return {
-        content: [{ type: "text" as const, text: truncated }],
-      };
-    } catch (err) {
-      return mcpError(err);
-    }
-  },
+  handleGetTranscript,
 );
-
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

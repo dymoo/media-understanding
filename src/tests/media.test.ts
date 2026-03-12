@@ -23,6 +23,8 @@ import {
   compressForLLM,
   extractFrame,
   extractFrameGrid,
+  extractFrameGridImages,
+  extractFrameImage,
   probeMedia,
   resolveModelDir,
   transcribeAudio,
@@ -187,6 +189,14 @@ describe("extractFrame", () => {
       },
     );
   });
+
+  it("returns exact frame timestamp metadata", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    const frame = await extractFrameImage(MP4, 0.5);
+    assert.equal(frame.timestampSec, 0.5);
+    assert.equal(frame.timestampLabel, "00:00:00.500");
+    assert.ok(Buffer.isBuffer(frame.image));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -212,14 +222,43 @@ describe("extractFrameGrid", () => {
     }
   });
 
-  it("returns empty array when frameInterval is very large", async (t) => {
+  it("fails fast for impossible sampling windows", async (t) => {
     if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
-    const grids = await extractFrameGrid(MP4, {
-      sceneThreshold: 1.0,
-      frameInterval: 100000,
+    await assert.rejects(
+      () =>
+        extractFrameGrid(MP4, {
+          maxGrids: 1,
+          cols: 1,
+          rows: 1,
+          startSec: 0,
+          endSec: 0.2,
+          secondsPerFrame: 1,
+        }),
+      (err: MediaError) => {
+        assert.ok(err instanceof MediaError);
+        assert.equal(err.code, "INVALID_SAMPLING");
+        return true;
+      },
+    );
+  });
+
+  it("returns grid metadata with exact tile timestamps", async (t) => {
+    if (!existsSync(MP4)) return t.skip("tiny.mp4 not present");
+    const grids = await extractFrameGridImages(MP4, {
       maxGrids: 1,
+      cols: 2,
+      rows: 2,
+      secondsPerFrame: 0.2,
+      startSec: 0,
+      endSec: 0.8,
     });
-    assert.ok(Array.isArray(grids));
+    assert.equal(grids.length, 1);
+    const [grid] = grids;
+    assert.ok(grid);
+    assert.equal(grid.tiles.length, 4);
+    assert.equal(grid.tiles[0]?.timestampLabel, "00:00:00.100");
+    assert.equal(grid.tiles[3]?.timestampLabel, "00:00:00.700");
+    assert.ok(Buffer.isBuffer(grid.image));
   });
 });
 
@@ -292,6 +331,7 @@ describe("understandMedia — video", { timeout: 5 * 60 * 1000 }, () => {
     });
     assert.equal(result.info.type, "video");
     assert.ok(Array.isArray(result.grids));
+    assert.ok(Array.isArray(result.gridImages));
     assert.ok(Array.isArray(result.segments));
     assert.equal(typeof result.transcript, "string");
   });

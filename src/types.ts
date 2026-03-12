@@ -36,6 +36,8 @@ export interface MediaInfo {
   sampleRate?: number;
   /** Audio channel count (undefined for images). */
   channels?: number;
+  /** File size in bytes. */
+  fileSizeBytes?: number;
 }
 
 /** Options controlling keyframe grid extraction. */
@@ -55,6 +57,13 @@ export interface GridOptions {
    */
   endSec?: number;
   /**
+   * Sampling strategy for video frames.
+   * `uniform` spreads samples across the requested window.
+   * `scene` uses scene-change detection plus periodic fallback sampling.
+   * @default "uniform"
+   */
+  samplingStrategy?: "uniform" | "scene";
+  /**
    * Scene-change detection threshold (0–1). Higher = fewer keyframes.
    * @default 0.3
    */
@@ -64,6 +73,16 @@ export interface GridOptions {
    * @default 300  (10 s at 30 fps)
    */
   frameInterval?: number;
+  /**
+   * Desired spacing between sampled frames within a grid, in seconds.
+   * If omitted, the spacing is derived from the requested time window.
+   */
+  secondsPerFrame?: number;
+  /**
+   * Desired spacing between composite grid windows, in seconds.
+   * If omitted, the spacing is derived from the requested time window.
+   */
+  secondsPerGrid?: number;
   /**
    * Columns in each grid tile.
    * @default 4
@@ -79,13 +98,20 @@ export interface GridOptions {
    * @default 480
    */
   thumbWidth?: number;
+  /**
+   * How frames should fit inside each tile.
+   * `contain` keeps the whole frame visible with letterboxing/pillarboxing.
+   * `cover` fills the tile and crops as needed.
+   * @default "contain"
+   */
+  aspectMode?: "contain" | "cover";
 }
 
 /** Options controlling transcription. */
 export interface TranscribeOptions {
   /**
    * Whisper model name.
-   * @default "tiny.en"
+   * @default "base.en-q5_1"
    */
   model?: string;
   /**
@@ -98,6 +124,36 @@ export interface TranscribeOptions {
 /** Options for understand_media — superset of grid + transcribe options. */
 export interface ProcessOptions extends GridOptions, TranscribeOptions {}
 
+/** One exact extracted video frame. */
+export interface VideoFrameImage {
+  /** JPEG image buffer ready for MCP serialization. */
+  image: Buffer;
+  /** Exact extraction timestamp in seconds. */
+  timestampSec: number;
+  /** Human-readable timestamp label, e.g. 00:01:23.456. */
+  timestampLabel: string;
+}
+
+/** One timestamped tile inside a composite grid image. */
+export interface VideoGridTile {
+  /** Exact extraction timestamp in seconds. */
+  timestampSec: number;
+  /** Human-readable timestamp label, e.g. 00:01:23.456. */
+  timestampLabel: string;
+}
+
+/** One composite grid image plus exact tile timestamps. */
+export interface VideoGridImage {
+  /** JPEG grid image buffer ready for MCP serialization. */
+  image: Buffer;
+  /** Inclusive start of the covered window in seconds. */
+  startSec: number;
+  /** Exclusive end of the covered window in seconds. */
+  endSec: number;
+  /** Exact timestamps for each tile in row-major order. */
+  tiles: VideoGridTile[];
+}
+
 /** The combined result returned by understandMedia(). */
 export interface UnderstandResult {
   info: MediaInfo;
@@ -107,6 +163,8 @@ export interface UnderstandResult {
   transcript: string;
   /** Keyframe grid images as JPEG buffers (video only). */
   grids: Buffer[];
+  /** Rich grid metadata, when available (video only). */
+  gridImages: VideoGridImage[];
 }
 
 /** Error codes for MediaError. */
@@ -119,6 +177,8 @@ export type MediaErrorCode =
   | "TRANSCRIBE_FAILED"
   | "GRID_FAILED"
   | "FRAME_FAILED"
+  | "INVALID_SAMPLING"
+  | "BUDGET_EXCEEDED"
   | "UNKNOWN";
 
 /** Structured error thrown by media processing functions. */
