@@ -257,9 +257,9 @@ JPEG contact sheets of thumbnails. Every tile has an exact timestamp overlay. Bu
 { "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }
 ```
 
-**Example output** — 4x4 grid from a 61-second portrait video (`thumb_width: 120, aspect_mode: "contain"`):
+**Example output** — 4x4 grid from a 16:9 landscape video (`thumb_width: 320`):
 
-![Example keyframe grid from get_video_grids — 4x4 contact sheet covering 0-61s with timestamp overlays on each tile](docs/assets/example-grid.jpg)
+![Example keyframe grid from get_video_grids — 4x4 contact sheet covering 30-90s with timestamp overlays on each tile](docs/assets/example-grid.jpg)
 
 ### `get_frames` — exact moments
 
@@ -270,9 +270,9 @@ One JPEG per requested timestamp. Each frame includes a timestamp overlay.
 { "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }
 ```
 
-**Example output** — single frame at t=30s:
+**Example output** — single frame at t=60s:
 
-![Example frame from get_frames — single frame extracted at 00:00:30.000 with filename and timestamp overlay](docs/assets/example-frame.jpg)
+![Example frame from get_frames — single frame extracted at 00:01:00.000 with filename and timestamp overlay](docs/assets/example-frame.jpg)
 
 ## Recommended LLM Workflow
 
