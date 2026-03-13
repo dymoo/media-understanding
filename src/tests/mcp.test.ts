@@ -218,6 +218,7 @@ describe("get_video_grids tool surface", () => {
       seconds_per_frame: 0.2,
       start_sec: 0,
       end_sec: 0.8,
+      thumb_width: 64, // tiny fixture — small thumb ensures image fits in budget
     });
     assert.ok(!("isError" in result));
     const textItems = result.content.filter((item) => item.type === "text");
