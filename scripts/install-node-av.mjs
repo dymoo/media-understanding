@@ -67,7 +67,13 @@ async function installPlatformBinding() {
 }
 
 async function installFfmpeg() {
-  const ffmpegInstallPath = require.resolve("node-av/dist/ffmpeg/install.js");
+  // Use a direct filesystem path instead of require.resolve() to avoid
+  // ERR_PACKAGE_PATH_NOT_EXPORTED on Node 24, which enforces the exports map
+  // strictly for subpath imports that node-av doesn't expose.
+  const ffmpegInstallPath = join(rootDir, "node_modules/node-av/dist/ffmpeg/install.js");
+  if (!existsSync(ffmpegInstallPath)) {
+    throw new Error(`node-av FFmpeg install script not found: ${ffmpegInstallPath}`);
+  }
   await runNode(ffmpegInstallPath);
 }
 
