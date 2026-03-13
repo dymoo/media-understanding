@@ -92,7 +92,7 @@ Examples:
         .string()
         .optional()
         .describe(
-          'Whisper model name. Default: "base.en-q5_1". Options: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3, tiny.en-q5_1, base.en-q5_1, small.en-q5_1, large-v3-turbo-q5_0.',
+          'Whisper model name. Default: "base.en-q5_1". Options: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3, tiny.en-q5_1, base.en-q5_1, small.en-q5_1, large-v3-turbo-q5_0. For non-English audio use multilingual variants (e.g. base-q5_1, small-q5_1). English-only models (*.en) already emit non-speech tokens like [Music] and (applause).',
         ),
       max_chars: z
         .number()
@@ -321,6 +321,8 @@ server.registerTool(
 
 Uses OpenAI's Whisper (via whisper.cpp). The model auto-downloads on first use
 (~57 MB for base.en-q5_1). Transcript is cached per file for the process lifetime.
+English-only models (*.en) already emit non-speech tokens (e.g. [Music], (applause)).
+For non-English audio, use multilingual variants: base-q5_1, small-q5_1, etc.
 
 Three output formats:
 - "text" (default): timestamped lines — "[start–end] text" per segment
@@ -345,7 +347,7 @@ Examples:
         .string()
         .optional()
         .describe(
-          'Whisper model. Default: "base.en-q5_1". Larger models are slower but more accurate.',
+          'Whisper model. Default: "base.en-q5_1". Larger models are slower but more accurate. Use multilingual variants (e.g. base-q5_1) for non-English audio.',
         ),
       max_chars: z
         .number()

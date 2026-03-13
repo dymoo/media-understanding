@@ -814,7 +814,7 @@ export async function transcribeAudio(
       `Invalid Whisper model name: "${modelName}". ` +
         `Valid models: tiny, tiny.en, base, base.en, small, small.en, ` +
         `medium, medium.en, large-v1, large-v2, large-v3, ` +
-        `tiny.en-q5_1, base.en-q5_1, small.en-q5_1, large-v3-turbo-q5_0, etc.`,
+        `tiny.en-q5_1, base.en-q5_1, base-q5_1, small.en-q5_1, large-v3-turbo-q5_0, etc.`,
     );
   }
 
