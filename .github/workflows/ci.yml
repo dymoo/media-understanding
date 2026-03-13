@@ -51,3 +51,40 @@ jobs:
 
       - name: Run tests (transcription skipped — no model in CI)
         run: SKIP_TRANSCRIPTION=1 pnpm test
+
+  npm-package-smoke:
+    name: npm package smoke install (macOS Node 24)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: SKIP_MODEL_DOWNLOAD=1 pnpm install --frozen-lockfile
+
+      - name: Build package
+        run: pnpm run build
+
+      - name: Pack npm tarball
+        run: npm pack
+
+      - name: Install tarball in fresh npm consumer
+        run: |
+          TARBALL="$(node -e "import { readdirSync } from 'node:fs'; const tarball = readdirSync('.').find((entry) => entry.endsWith('.tgz')); if (!tarball) throw new Error('npm pack did not produce a tarball'); process.stdout.write(tarball);")"
+          CONSUMER_DIR="$(mktemp -d)"
+          cp "$TARBALL" "$CONSUMER_DIR/"
+          cd "$CONSUMER_DIR"
+          npm init -y
+          SKIP_MODEL_DOWNLOAD=1 npm install --foreground-scripts "./$TARBALL"
+          node --input-type=module -e "await import('@dymoo/media-understanding'); console.log('ok');"

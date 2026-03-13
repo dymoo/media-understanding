@@ -1,13 +1,13 @@
 {
   "name": "@dymoo/media-understanding",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server that converts audio/video/image to text + images for LLM consumption",
   "type": "module",
   "license": "MIT",
   "author": "dymoo",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dymoo/media-understanding.git"
+    "url": "git+https://github.com/dymoo/media-understanding.git"
   },
   "keywords": [
     "mcp",
@@ -28,8 +28,8 @@
     ".": "./dist/index.js"
   },
   "bin": {
-    "media-understanding": "./dist/cli.js",
-    "media-understanding-mcp": "./dist/mcp.js"
+    "media-understanding": "dist/cli.js",
+    "media-understanding-mcp": "dist/mcp.js"
   },
   "files": [
     "dist",
