@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write # Required for npm OIDC trusted publishing
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +23,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24 # Trusted publishing requires Node >= 22.14.0; use 24 for margin
           cache: pnpm
           registry-url: https://registry.npmjs.org
 
@@ -38,7 +39,7 @@ jobs:
       - name: Build
         run: pnpm run build
 
-      - name: Publish to npm
-        run: pnpm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (OIDC trusted publishing — no token required)
+        run: npm publish --access public --ignore-scripts
+        # --ignore-scripts skips prepublishOnly (check-all + build already ran above)
+        # NODE_AUTH_TOKEN not needed — npm CLI auto-detects GitHub OIDC environment
