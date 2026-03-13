@@ -82,10 +82,26 @@ when you only need one modality, prefer the focused tools instead.
 For multiple files, use probe_media first to discover and triage, then call this
 tool once per file that needs full analysis.
 
+**Content-type guidance (set params before calling):**
+- Podcast / interview / lecture: transcript is the primary signal. Grids add little.
+  Use get_transcript for audio-only. For video, omit grid params or use max_grids=1.
+- Screen recording / UI walkthrough / tutorial: use sampling_strategy="scene" so
+  grids capture actual transitions rather than redundant uniform frames. Use
+  thumb_width=320 or higher so UI text is legible. Transcript is still primary.
+- Film / B-roll / sports: uniform sampling (default) is correct. Default thumb_width
+  (480) is fine. Grids are the primary signal.
+- Portrait video (phone, TikTok): server auto-defaults to cols=3, rows=3,
+  thumb_width=120 — no manual adjustment needed.
+
+**Two-step workflow for long videos (>10 min):**
+1. get_transcript(file, { format: "srt" }) — fast overview, identify key moments
+2. get_frames(file, { timestamps: [...] }) — pull exact frames at those moments
+
 Examples:
   { "file_path": "/path/to/video.mp4" }
   { "file_path": "/path/to/podcast.mp3", "model": "base.en" }
-  { "file_path": "/path/to/clip.mp4", "start_sec": 60, "end_sec": 120, "max_grids": 3 }`,
+  { "file_path": "/path/to/clip.mp4", "start_sec": 60, "end_sec": 120, "max_grids": 3 }
+  { "file_path": "/path/to/screen-recording.mp4", "sampling_strategy": "scene", "thumb_width": 320 }`,
     inputSchema: z.object({
       file_path: z.string().describe("Absolute or relative path to a single media file."),
       model: z
@@ -130,7 +146,7 @@ Examples:
         .enum(["uniform", "scene"])
         .optional()
         .describe(
-          "Sampling strategy. `uniform` is the default and covers the whole window evenly.",
+          "Sampling strategy. `uniform` (default) covers the window evenly — best for film/sports. `scene` captures frames at detected scene changes — best for screen recordings, slideshows, and lecture capture where uniform wastes budget on static high-fps content.",
         ),
       seconds_per_frame: z
         .number()
@@ -166,7 +182,7 @@ Examples:
         .positive()
         .optional()
         .describe(
-          "Thumbnail width in pixels per cell (default 480; portrait video defaults to 120 when omitted).",
+          "Thumbnail width in pixels per cell (default 480; portrait video defaults to 120 when omitted). Use 320+ for screen recordings where UI text must be legible. Use 120 for a cheap overview where text is not needed.",
         ),
     }),
   },
@@ -185,9 +201,23 @@ exact timestamps in row-major order.
 Use this for visual inspection without transcription. It is budget-aware: if
 you omit max_grids, the server returns as many grids as fit under max_total_chars.
 
+**Sampling strategy:**
+- uniform (default): evenly-spaced frames across the window. Best for film,
+  B-roll, sports, or any content where action is continuous.
+- scene: only captures frames at detected scene changes. Best for screen
+  recordings, slideshows, lecture capture, and UI walkthroughs — uniform wastes
+  budget on static content at high fps. Use frame_interval as a fallback cap.
+
+**thumb_width guidance:**
+- 480 (default): good for film/video where you need visual detail.
+- 320: readable for screen recordings with large UI elements.
+- 120: overview-only; UI text will not be legible.
+- Portrait video: server auto-defaults to 120 — no adjustment needed.
+
 Examples:
   { "file_path": "/path/to/video.mp4" }
   { "file_path": "/path/to/movie.mkv", "start_sec": 300, "end_sec": 600, "max_grids": 2, "seconds_per_frame": 8 }
+  { "file_path": "/path/to/screen-recording.mp4", "sampling_strategy": "scene", "thumb_width": 320 }
   { "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to a video file."),
@@ -221,7 +251,7 @@ Examples:
         .enum(["uniform", "scene"])
         .optional()
         .describe(
-          "Sampling strategy. `uniform` is the default and covers the whole window evenly.",
+          "Sampling strategy. `uniform` (default) covers the window evenly — best for film/sports. `scene` captures frames at detected scene changes — best for screen recordings, slideshows, and lecture capture where uniform wastes budget on static high-fps content.",
         ),
       scene_threshold: z
         .number()
@@ -273,7 +303,7 @@ Examples:
         .positive()
         .optional()
         .describe(
-          "Thumbnail width per cell in pixels (default 480; portrait video defaults to 120 when omitted).",
+          "Thumbnail width per cell in pixels (default 480; portrait video defaults to 120 when omitted). Use 320+ for screen recordings where UI text must be legible. Use 120 for a cheap overview where text is not needed.",
         ),
     }),
   },
