@@ -2,6 +2,8 @@
  * Shared types for media-understanding.
  */
 
+import type { AccelInfo } from "./accel.js";
+
 /** A Whisper transcription segment with millisecond timestamps. */
 export interface Segment {
   /** Start time in milliseconds. */
@@ -38,6 +40,8 @@ export interface MediaInfo {
   channels?: number;
   /** File size in bytes. */
   fileSizeBytes?: number;
+  /** Hardware acceleration backend used when processing this file (video only). */
+  acceleration?: AccelInfo;
 }
 
 /** Options controlling keyframe grid extraction. */

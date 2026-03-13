@@ -9,9 +9,9 @@ import { join, resolve } from "node:path";
 
 import { fileTypeFromFile } from "file-type";
 import { Decoder, Demuxer, WhisperDownloader, WhisperTranscriber } from "node-av/api";
-import { AVSEEK_FLAG_BACKWARD, AV_PIX_FMT_RGB24, SWS_BILINEAR } from "node-av/constants";
+import { AVSEEK_FLAG_BACKWARD } from "node-av/constants";
 import { isFfmpegAvailable } from "node-av/ffmpeg";
-import { FFmpegError as NativeFFmpegError, Frame, SoftwareScaleContext } from "node-av/lib";
+import type { Frame } from "node-av/lib";
 import { avGetCodecName } from "node-av/lib";
 import sharp from "sharp";
 
@@ -27,6 +27,8 @@ import type {
   UnderstandResult,
 } from "./types.js";
 import { MediaError } from "./types.js";
+import { getAdapter, getSoftwareAdapter } from "./accel.js";
+import type { AccelAdapter } from "./accel.js";
 
 // ---------------------------------------------------------------------------
 // Process-level counting semaphore for heavy operations (frame extraction,
@@ -518,6 +520,121 @@ export async function extractFrameImages(
 }
 
 // ---------------------------------------------------------------------------
+// decodeOneFrameWithAdapter — internal per-timestamp helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode one video frame at `ts` seconds, scale+encode it as JPEG with the
+ * given adapter, and add a timestamp overlay.
+ *
+ * Opens its own Demuxer so it can be called independently — this is
+ * intentional: it lets extractFramesBatch retry individual timestamps with a
+ * different adapter (e.g. SW fallback after HW failure) without re-using a
+ * potentially corrupt decoder session.
+ *
+ * Caller is responsible for holding the heavy-op semaphore.
+ */
+async function decodeOneFrameWithAdapter(
+  filePath: string,
+  ts: number,
+  adapter: AccelAdapter,
+  overlayPrefix?: string,
+): Promise<{ timestampSec: number; buffer: Buffer }> {
+  await using demuxer = await Demuxer.open(filePath);
+  const videoStream = demuxer.video();
+  if (!videoStream) {
+    throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${filePath}`);
+  }
+
+  const streamIndex = videoStream.index;
+  const duration = demuxer.duration;
+  const targetSec = Math.min(ts, Math.max(0, duration - 0.2));
+  const tb = videoStream.timeBase;
+  const targetPts = BigInt(Math.round((targetSec * tb.den) / tb.num));
+
+  using decoder = await adapter.createDecoder(videoStream);
+
+  if (targetSec > 0) {
+    await demuxer.seek(targetSec, streamIndex, AVSEEK_FLAG_BACKWARD);
+  }
+
+  let bestFrame: Frame | null = null;
+  let bestPts: bigint = BigInt(-1);
+  let foundExact = false;
+
+  // Phase 1: Feed packets and drain frames.
+  for await (const packet of demuxer.packets(streamIndex)) {
+    if (packet === null) break;
+
+    await decoder.decode(packet);
+
+    let frame: Frame | null | undefined;
+    while ((frame = (await decoder.receive()) as Frame | null) !== null && frame !== undefined) {
+      const framePts = frame.bestEffortTimestamp;
+
+      if (framePts >= targetPts) {
+        // At or past target — keep it and stop.
+        if (bestFrame) bestFrame.free();
+        bestFrame = frame;
+        bestPts = framePts;
+        foundExact = true;
+        break;
+      }
+
+      // Before target — keep closest so far.
+      if (bestFrame) bestFrame.free();
+      bestFrame = frame;
+      bestPts = framePts;
+    }
+
+    if (foundExact) break;
+  }
+
+  // Phase 2: Flush decoder to emit B-frame-buffered frames.
+  if (!foundExact) {
+    try {
+      await decoder.decode(null);
+    } catch {
+      // Some decoders don't accept null flush — ignore.
+    }
+
+    let frame: Frame | null | undefined;
+    while ((frame = (await decoder.receive()) as Frame | null) !== null && frame !== undefined) {
+      const framePts = frame.bestEffortTimestamp;
+
+      if (bestFrame === null || (bestPts < targetPts && framePts >= targetPts)) {
+        if (bestFrame) bestFrame.free();
+        bestFrame = frame;
+        bestPts = framePts;
+        if (framePts >= targetPts) break;
+      } else if (framePts > bestPts && framePts < targetPts) {
+        // Closer to target but still before it.
+        if (bestFrame) bestFrame.free();
+        bestFrame = frame;
+        bestPts = framePts;
+      } else {
+        frame.free();
+      }
+    }
+  }
+
+  if (!bestFrame) {
+    throw new MediaError("FRAME_FAILED", `No frame decoded at ${ts}s in: ${filePath}`);
+  }
+
+  try {
+    const compressed = await adapter.scaleAndEncode(bestFrame, 1280, "q75");
+    const safeTs = Math.min(ts, Math.max(0, duration - 0.2));
+    const overlayLabel =
+      `${overlayPrefix ? `${overlayPrefix.split("/").at(-1) ?? overlayPrefix} ` : ""}${formatTimestamp(safeTs)}`.trim();
+    const withOverlay = await addTimestampOverlay(compressed, overlayLabel);
+    return { timestampSec: ts, buffer: withOverlay };
+  } finally {
+    bestFrame.free();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // extractFramesBatch — native batch frame extraction via node-av
 // ---------------------------------------------------------------------------
 
@@ -531,8 +648,11 @@ export async function extractFrameImages(
  * flushed (send null packet) to emit B-frame-buffered frames — critical
  * for codecs with reordering delay (e.g. H.264 with B-frames).
  *
- * The SoftwareScaleContext (YUV→RGB24) is lazily initialised and reused
- * across timestamps as long as source dimensions/format remain constant.
+ * Frame scaling and JPEG encoding are delegated to the process-level
+ * AccelAdapter (hardware-accelerated when available via HardwareContext.auto()).
+ * If the HW adapter fails for any timestamp, a warning is logged to stderr
+ * (visible to the LLM via the MCP client) and that timestamp is retried with
+ * a pure software decoder + filter path.
  *
  * Guarded by the process-level heavy-op semaphore.
  *
@@ -553,174 +673,33 @@ async function extractFramesBatch(
   work.sort((a, b) => a.ts - b.ts);
 
   const results = new Array<{ timestampSec: number; buffer: Buffer }>(timestampsSec.length);
+  const adapter = getAdapter();
 
   await withHeavyOp(async () => {
-    // Shared scaler state — lazy-init'd on first frame, reused across timestamps.
-    let scaler: SoftwareScaleContext | null = null;
-    let dstFrame: Frame | null = null;
-    let scalerSrcW = 0;
-    let scalerSrcH = 0;
-    let scalerSrcFmt = -1;
-
-    try {
-      for (const item of work) {
-        // Open a fresh Demuxer+Decoder per timestamp (packets() is not reusable after seek).
-        await using demuxer = await Demuxer.open(filePath);
-        const videoStream = demuxer.video();
-        if (!videoStream) {
-          throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${filePath}`);
-        }
-
-        const streamIndex = videoStream.index;
-        const duration = demuxer.duration;
-        const targetSec = Math.min(item.ts, Math.max(0, duration - 0.2));
-        const tb = videoStream.timeBase;
-        const targetPts = BigInt(Math.round((targetSec * tb.den) / tb.num));
-
-        using decoder = await Decoder.create(videoStream);
-
-        // Seek to the nearest keyframe before the target timestamp.
-        if (targetSec > 0) {
-          await demuxer.seek(targetSec, streamIndex, AVSEEK_FLAG_BACKWARD);
-        }
-
-        // Decode forward, collecting the best frame (closest to or past targetPts).
-        let bestFrame: Frame | null = null;
-        let bestPts: bigint = BigInt(-1);
-        let foundExact = false;
-
-        // Phase 1: Feed packets and drain frames.
-        for await (const packet of demuxer.packets(streamIndex)) {
-          if (packet === null) break;
-
-          await decoder.decode(packet);
-
-          let frame: Frame | null | undefined;
-          while (
-            (frame = (await decoder.receive()) as Frame | null) !== null &&
-            frame !== undefined
-          ) {
-            const framePts = frame.bestEffortTimestamp;
-
-            if (framePts >= targetPts) {
-              // At or past target — keep it and stop.
-              if (bestFrame) bestFrame.free();
-              bestFrame = frame;
-              bestPts = framePts;
-              foundExact = true;
-              break;
-            }
-
-            // Before target — keep closest so far.
-            if (bestFrame) bestFrame.free();
-            bestFrame = frame;
-            bestPts = framePts;
-          }
-
-          if (foundExact) break;
-        }
-
-        // Phase 2: Flush decoder to emit B-frame-buffered frames.
-        if (!foundExact) {
-          try {
-            await decoder.decode(null);
-          } catch {
-            // Some decoders don't accept null flush — ignore.
-          }
-
-          let frame: Frame | null | undefined;
-          while (
-            (frame = (await decoder.receive()) as Frame | null) !== null &&
-            frame !== undefined
-          ) {
-            const framePts = frame.bestEffortTimestamp;
-
-            if (bestFrame === null || (bestPts < targetPts && framePts >= targetPts)) {
-              if (bestFrame) bestFrame.free();
-              bestFrame = frame;
-              bestPts = framePts;
-              if (framePts >= targetPts) break;
-            } else if (framePts > bestPts && framePts < targetPts) {
-              // Closer to target but still before it.
-              if (bestFrame) bestFrame.free();
-              bestFrame = frame;
-              bestPts = framePts;
-            } else {
-              frame.free();
-            }
-          }
-        }
-
-        if (!bestFrame) {
-          throw new MediaError("FRAME_FAILED", `No frame decoded at ${item.ts}s in: ${filePath}`);
-        }
-
-        try {
-          // Lazy-init or reinit scaler if source dimensions/format changed.
-          const srcW = bestFrame.width;
-          const srcH = bestFrame.height;
-          const srcFmt = bestFrame.format as number;
-
-          if (!scaler || srcW !== scalerSrcW || srcH !== scalerSrcH || srcFmt !== scalerSrcFmt) {
-            if (scaler) scaler.freeContext();
-            if (dstFrame) dstFrame.free();
-
-            scaler = new SoftwareScaleContext();
-            scaler.getContext(
-              srcW,
-              srcH,
-              bestFrame.format as typeof AV_PIX_FMT_RGB24,
-              srcW,
-              srcH,
-              AV_PIX_FMT_RGB24,
-              SWS_BILINEAR,
-            );
-            const initRet = scaler.initContext();
-            NativeFFmpegError.throwIfError(initRet, "initContext");
-
-            dstFrame = new Frame();
-            dstFrame.alloc();
-            dstFrame.width = srcW;
-            dstFrame.height = srcH;
-            dstFrame.format = AV_PIX_FMT_RGB24;
-            const allocRet = dstFrame.allocBuffer();
-            NativeFFmpegError.throwIfError(allocRet, "allocBuffer");
-
-            scalerSrcW = srcW;
-            scalerSrcH = srcH;
-            scalerSrcFmt = srcFmt;
-          }
-
-          // Scale YUV → RGB24
-          const scaleRet = await scaler.scaleFrame(dstFrame!, bestFrame);
-          NativeFFmpegError.throwIfError(scaleRet, "scaleFrame");
-
-          // Get RGB buffer and encode to JPEG via sharp.
-          const rgbBuffer = dstFrame!.toBuffer();
-          const compressed = await sharp(rgbBuffer, {
-            raw: { width: srcW, height: srcH, channels: 3 },
-          })
-            .resize({ width: Math.min(srcW, 1280), withoutEnlargement: true })
-            .jpeg({ quality: 75 })
-            .toBuffer();
-
-          // Add timestamp overlay.
-          const safeTs = Math.min(item.ts, Math.max(0, duration - 0.2));
-          const overlayLabel =
-            `${overlayPrefix ? `${overlayPrefix.split("/").at(-1) ?? overlayPrefix} ` : ""}${formatTimestamp(safeTs)}`.trim();
-          const withOverlay = await addTimestampOverlay(compressed, overlayLabel);
-
-          results[item.originalIndex] = {
-            timestampSec: item.ts,
-            buffer: withOverlay,
-          };
-        } finally {
-          bestFrame.free();
+    for (const item of work) {
+      let result: { timestampSec: number; buffer: Buffer };
+      try {
+        result = await decodeOneFrameWithAdapter(filePath, item.ts, adapter, overlayPrefix);
+      } catch (hwErr) {
+        if (adapter.info.hardware) {
+          // HW path failed. Log to stderr — MCP clients forward stderr to the
+          // LLM so it can see why the fallback occurred.
+          console.error(
+            `[media-understanding] HW acceleration (${adapter.info.backend}) failed ` +
+              `for ${filePath} at ${item.ts}s — retrying with software: ` +
+              `${hwErr instanceof Error ? hwErr.message : String(hwErr)}`,
+          );
+          result = await decodeOneFrameWithAdapter(
+            filePath,
+            item.ts,
+            getSoftwareAdapter(),
+            overlayPrefix,
+          );
+        } else {
+          throw hwErr;
         }
       }
-    } finally {
-      if (dstFrame) dstFrame.free();
-      if (scaler) scaler.freeContext();
+      results[item.originalIndex] = result;
     }
   });
 
@@ -743,13 +722,14 @@ export async function probeMedia(filePath: string): Promise<MediaInfo> {
 
   if (kind === "image") {
     try {
-      const meta = await sharp(abs).metadata();
+      const adapter = getAdapter();
+      const dims = await adapter.probeImageDimensions(abs);
       return {
         path: abs,
         type: "image",
         duration: 0,
-        width: meta.width,
-        height: meta.height,
+        width: dims.width,
+        height: dims.height,
         fileSizeBytes,
       };
     } catch (err) {
@@ -796,6 +776,12 @@ export async function probeMedia(filePath: string): Promise<MediaInfo> {
       if (ac !== null) info.audioCodec = ac;
       info.sampleRate = cp.sampleRate;
       info.channels = cp.channels;
+    }
+
+    // Expose the active acceleration backend for video files so callers
+    // (and MCP clients) can see whether HW acceleration is in use.
+    if (hasVideo) {
+      info.acceleration = getAdapter().info;
     }
 
     return info;
@@ -981,42 +967,15 @@ async function composeGrid(
     throw new MediaError("GRID_FAILED", "No frames to compose into grid");
   }
 
-  const firstMeta = await sharp(firstFrame.image).metadata();
-  const sourceW = firstMeta.width ?? thumbWidth;
-  const sourceH = firstMeta.height ?? Math.round((thumbWidth * 3) / 4);
+  const adapter = getAdapter();
+  const firstDims = await adapter.probeBufferDimensions(firstFrame.image);
+  const sourceW = firstDims.width;
+  const sourceH = firstDims.height;
   const tileW = thumbWidth;
   const tileH = Math.max(1, Math.round((thumbWidth * sourceH) / sourceW));
 
   const thumbs = await Promise.all(
-    frames.map(async (frame) => {
-      if (aspectMode === "cover") {
-        return sharp(frame.image)
-          .resize(tileW, tileH, { fit: "cover", position: "centre" })
-          .jpeg({ quality: 82 })
-          .toBuffer();
-      }
-
-      return sharp({
-        create: {
-          width: tileW,
-          height: tileH,
-          channels: 3,
-          background: { r: 0, g: 0, b: 0 },
-        },
-      })
-        .composite([
-          {
-            input: await sharp(frame.image)
-              .resize(tileW, tileH, { fit: "contain", background: { r: 0, g: 0, b: 0 } })
-              .jpeg({ quality: 82 })
-              .toBuffer(),
-            left: 0,
-            top: 0,
-          },
-        ])
-        .jpeg({ quality: 82 })
-        .toBuffer();
-    }),
+    frames.map((frame) => adapter.resizeJpeg(frame.image, tileW, tileH, "q82", aspectMode)),
   );
 
   const rows = Math.ceil(frames.length / cols);

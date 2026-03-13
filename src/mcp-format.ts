@@ -193,5 +193,10 @@ export function formatMediaInfo(info: MediaInfo): string {
   if (info.sampleRate !== undefined) lines.push(`Sample rate: ${info.sampleRate}Hz`);
   if (info.channels !== undefined) lines.push(`Channels: ${info.channels}`);
   if (info.fileSizeBytes !== undefined) lines.push(`Size: ${info.fileSizeBytes} bytes`);
+  if (info.acceleration !== undefined) {
+    lines.push(
+      `Acceleration: ${info.acceleration.backend}${info.acceleration.hardware ? " (hardware)" : " (software)"}`,
+    );
+  }
   return lines.join("\n");
 }
