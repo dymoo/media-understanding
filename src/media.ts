@@ -2,17 +2,17 @@
  * Core media processing: probe, transcribe, extract grids/frames.
  */
 
-import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
 
 import { fileTypeFromFile } from "file-type";
 import { Decoder, Demuxer, WhisperDownloader, WhisperTranscriber } from "node-av/api";
+import { AVSEEK_FLAG_BACKWARD, AV_PIX_FMT_RGB24, SWS_BILINEAR } from "node-av/constants";
+import { isFfmpegAvailable } from "node-av/ffmpeg";
+import { FFmpegError as NativeFFmpegError, Frame, SoftwareScaleContext } from "node-av/lib";
 import { avGetCodecName } from "node-av/lib";
-import { ffmpegPath, isFfmpegAvailable } from "node-av/ffmpeg";
 import sharp from "sharp";
 
 import type {
@@ -28,7 +28,53 @@ import type {
 } from "./types.js";
 import { MediaError } from "./types.js";
 
-const execFile = promisify(execFileCb);
+// ---------------------------------------------------------------------------
+// Process-level counting semaphore for heavy operations (frame extraction,
+// transcription). Limits concurrent native-resource usage to avoid memory
+// spikes and GPU contention. Excess callers queue as Promises (FIFO).
+// ---------------------------------------------------------------------------
+
+const HEAVY_OP_CONCURRENCY = 2;
+
+class Semaphore {
+  private permits: number;
+  private queue: Array<() => void> = [];
+
+  constructor(permits: number) {
+    this.permits = permits;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.permits > 0) {
+      this.permits--;
+      return;
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    } else {
+      this.permits++;
+    }
+  }
+}
+
+const heavySemaphore = new Semaphore(HEAVY_OP_CONCURRENCY);
+
+/** Run `fn` under the shared heavy-operation semaphore. */
+async function withHeavyOp<T>(fn: () => Promise<T>): Promise<T> {
+  await heavySemaphore.acquire();
+  try {
+    return await fn();
+  } finally {
+    heavySemaphore.release();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Bounded LRU transcript cache (keyed by SHA-256 content fingerprint).
@@ -100,7 +146,6 @@ const PORTRAIT_DEFAULT_COLS = 3;
 const PORTRAIT_DEFAULT_ROWS = 3;
 const PORTRAIT_DEFAULT_THUMB_WIDTH = 120;
 const DEFAULT_SAMPLING_STRATEGY = "uniform" as const;
-const FRAME_EXTRACTION_CONCURRENCY = 4;
 const OVERLAY_BANNER_HEIGHT = 34;
 const OVERLAY_FONT_SIZE = 20;
 const OVERLAY_PADDING = 8;
@@ -236,31 +281,6 @@ export function truncateTranscript(text: string, maxChars: number): string {
   const keep1 = Math.floor(maxChars * 0.6);
   const keep2 = maxChars - keep1;
   return text.slice(0, keep1) + "\n\n[…transcript truncated…]\n\n" + text.slice(-keep2);
-}
-
-/**
- * Map over items with bounded concurrency.
- * At most `limit` items are processed simultaneously.
- * Safe in single-threaded JS: index increment is synchronous between await points.
- */
-async function mapWithLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-
-  async function worker(): Promise<void> {
-    while (nextIndex < items.length) {
-      const i = nextIndex++;
-      results[i] = await fn(items[i]!);
-    }
-  }
-
-  const workerCount = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
 }
 
 function formatTimestamp(timestampSec: number): string {
@@ -456,19 +476,6 @@ function planVideoSampling(opts: NormalizedGridOptions, durationSec: number): Pl
   return buildUniformSamplingPlan(opts);
 }
 
-async function buildVideoFrameImage(
-  filePath: string,
-  timestampSec: number,
-  overlayPrefix?: string,
-): Promise<VideoFrameImage> {
-  const image = await extractFrame(filePath, timestampSec, overlayPrefix);
-  return {
-    image,
-    timestampSec,
-    timestampLabel: formatTimestamp(timestampSec),
-  };
-}
-
 /**
  * Extract a single video frame and return both the image and its exact timestamp.
  */
@@ -476,8 +483,248 @@ export async function extractFrameImage(
   filePath: string,
   timestampSec: number,
 ): Promise<VideoFrameImage> {
+  assertFfmpeg();
   const { abs } = await assertFile(filePath);
-  return buildVideoFrameImage(abs, timestampSec, abs);
+  const batch = await extractFramesBatch(abs, [timestampSec], abs);
+  const result = batch[0];
+  if (!result) {
+    throw new MediaError("FRAME_FAILED", `No frame data returned at ${timestampSec}s in: ${abs}`);
+  }
+  return {
+    image: result.buffer,
+    timestampSec: result.timestampSec,
+    timestampLabel: formatTimestamp(result.timestampSec),
+  };
+}
+
+/**
+ * Extract multiple video frames in one batch call.
+ * Returns VideoFrameImage[] in the same order as the input timestamps.
+ * Opens a single Demuxer/Decoder session for all frames — much faster
+ * than calling extractFrameImage() in a loop.
+ */
+export async function extractFrameImages(
+  filePath: string,
+  timestampsSec: number[],
+): Promise<VideoFrameImage[]> {
+  assertFfmpeg();
+  const { abs } = await assertFile(filePath);
+  const batch = await extractFramesBatch(abs, timestampsSec, abs);
+  return batch.map((r) => ({
+    image: r.buffer,
+    timestampSec: r.timestampSec,
+    timestampLabel: formatTimestamp(r.timestampSec),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// extractFramesBatch — native batch frame extraction via node-av
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract multiple video frames in a single semaphore-guarded session.
+ * Opens a fresh Demuxer+Decoder per target timestamp because the node-av
+ * `packets()` async generator cannot be restarted after a seek. Each
+ * Demuxer open is lightweight (~1ms) vs. the old FFmpeg CLI spawn (~50ms).
+ *
+ * After feeding all packets from the seek point forward, the decoder is
+ * flushed (send null packet) to emit B-frame-buffered frames — critical
+ * for codecs with reordering delay (e.g. H.264 with B-frames).
+ *
+ * The SoftwareScaleContext (YUV→RGB24) is lazily initialised and reused
+ * across timestamps as long as source dimensions/format remain constant.
+ *
+ * Guarded by the process-level heavy-op semaphore.
+ *
+ * @param filePath Absolute path to a video file.
+ * @param timestampsSec Timestamps in seconds to extract (need not be sorted).
+ * @param overlayPrefix Optional prefix for the timestamp overlay label.
+ * @returns Array of { timestampSec, buffer } in the SAME order as `timestampsSec`.
+ */
+async function extractFramesBatch(
+  filePath: string,
+  timestampsSec: number[],
+  overlayPrefix?: string,
+): Promise<Array<{ timestampSec: number; buffer: Buffer }>> {
+  if (timestampsSec.length === 0) return [];
+
+  // Build sorted work list, preserving original indices for output ordering.
+  const work = timestampsSec.map((ts, i) => ({ ts, originalIndex: i }));
+  work.sort((a, b) => a.ts - b.ts);
+
+  const results = new Array<{ timestampSec: number; buffer: Buffer }>(timestampsSec.length);
+
+  await withHeavyOp(async () => {
+    // Shared scaler state — lazy-init'd on first frame, reused across timestamps.
+    let scaler: SoftwareScaleContext | null = null;
+    let dstFrame: Frame | null = null;
+    let scalerSrcW = 0;
+    let scalerSrcH = 0;
+    let scalerSrcFmt = -1;
+
+    try {
+      for (const item of work) {
+        // Open a fresh Demuxer+Decoder per timestamp (packets() is not reusable after seek).
+        await using demuxer = await Demuxer.open(filePath);
+        const videoStream = demuxer.video();
+        if (!videoStream) {
+          throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${filePath}`);
+        }
+
+        const streamIndex = videoStream.index;
+        const duration = demuxer.duration;
+        const targetSec = Math.min(item.ts, Math.max(0, duration - 0.2));
+        const tb = videoStream.timeBase;
+        const targetPts = BigInt(Math.round((targetSec * tb.den) / tb.num));
+
+        using decoder = await Decoder.create(videoStream);
+
+        // Seek to the nearest keyframe before the target timestamp.
+        if (targetSec > 0) {
+          await demuxer.seek(targetSec, streamIndex, AVSEEK_FLAG_BACKWARD);
+        }
+
+        // Decode forward, collecting the best frame (closest to or past targetPts).
+        let bestFrame: Frame | null = null;
+        let bestPts: bigint = BigInt(-1);
+        let foundExact = false;
+
+        // Phase 1: Feed packets and drain frames.
+        for await (const packet of demuxer.packets(streamIndex)) {
+          if (packet === null) break;
+
+          await decoder.decode(packet);
+
+          let frame: Frame | null | undefined;
+          while (
+            (frame = (await decoder.receive()) as Frame | null) !== null &&
+            frame !== undefined
+          ) {
+            const framePts = frame.bestEffortTimestamp;
+
+            if (framePts >= targetPts) {
+              // At or past target — keep it and stop.
+              if (bestFrame) bestFrame.free();
+              bestFrame = frame;
+              bestPts = framePts;
+              foundExact = true;
+              break;
+            }
+
+            // Before target — keep closest so far.
+            if (bestFrame) bestFrame.free();
+            bestFrame = frame;
+            bestPts = framePts;
+          }
+
+          if (foundExact) break;
+        }
+
+        // Phase 2: Flush decoder to emit B-frame-buffered frames.
+        if (!foundExact) {
+          try {
+            await decoder.decode(null);
+          } catch {
+            // Some decoders don't accept null flush — ignore.
+          }
+
+          let frame: Frame | null | undefined;
+          while (
+            (frame = (await decoder.receive()) as Frame | null) !== null &&
+            frame !== undefined
+          ) {
+            const framePts = frame.bestEffortTimestamp;
+
+            if (bestFrame === null || (bestPts < targetPts && framePts >= targetPts)) {
+              if (bestFrame) bestFrame.free();
+              bestFrame = frame;
+              bestPts = framePts;
+              if (framePts >= targetPts) break;
+            } else if (framePts > bestPts && framePts < targetPts) {
+              // Closer to target but still before it.
+              if (bestFrame) bestFrame.free();
+              bestFrame = frame;
+              bestPts = framePts;
+            } else {
+              frame.free();
+            }
+          }
+        }
+
+        if (!bestFrame) {
+          throw new MediaError("FRAME_FAILED", `No frame decoded at ${item.ts}s in: ${filePath}`);
+        }
+
+        try {
+          // Lazy-init or reinit scaler if source dimensions/format changed.
+          const srcW = bestFrame.width;
+          const srcH = bestFrame.height;
+          const srcFmt = bestFrame.format as number;
+
+          if (!scaler || srcW !== scalerSrcW || srcH !== scalerSrcH || srcFmt !== scalerSrcFmt) {
+            if (scaler) scaler.freeContext();
+            if (dstFrame) dstFrame.free();
+
+            scaler = new SoftwareScaleContext();
+            scaler.getContext(
+              srcW,
+              srcH,
+              bestFrame.format as typeof AV_PIX_FMT_RGB24,
+              srcW,
+              srcH,
+              AV_PIX_FMT_RGB24,
+              SWS_BILINEAR,
+            );
+            const initRet = scaler.initContext();
+            NativeFFmpegError.throwIfError(initRet, "initContext");
+
+            dstFrame = new Frame();
+            dstFrame.alloc();
+            dstFrame.width = srcW;
+            dstFrame.height = srcH;
+            dstFrame.format = AV_PIX_FMT_RGB24;
+            const allocRet = dstFrame.allocBuffer();
+            NativeFFmpegError.throwIfError(allocRet, "allocBuffer");
+
+            scalerSrcW = srcW;
+            scalerSrcH = srcH;
+            scalerSrcFmt = srcFmt;
+          }
+
+          // Scale YUV → RGB24
+          const scaleRet = await scaler.scaleFrame(dstFrame!, bestFrame);
+          NativeFFmpegError.throwIfError(scaleRet, "scaleFrame");
+
+          // Get RGB buffer and encode to JPEG via sharp.
+          const rgbBuffer = dstFrame!.toBuffer();
+          const compressed = await sharp(rgbBuffer, {
+            raw: { width: srcW, height: srcH, channels: 3 },
+          })
+            .resize({ width: Math.min(srcW, 1280), withoutEnlargement: true })
+            .jpeg({ quality: 75 })
+            .toBuffer();
+
+          // Add timestamp overlay.
+          const safeTs = Math.min(item.ts, Math.max(0, duration - 0.2));
+          const overlayLabel =
+            `${overlayPrefix ? `${overlayPrefix.split("/").at(-1) ?? overlayPrefix} ` : ""}${formatTimestamp(safeTs)}`.trim();
+          const withOverlay = await addTimestampOverlay(compressed, overlayLabel);
+
+          results[item.originalIndex] = {
+            timestampSec: item.ts,
+            buffer: withOverlay,
+          };
+        } finally {
+          bestFrame.free();
+        }
+      }
+    } finally {
+      if (dstFrame) dstFrame.free();
+      if (scaler) scaler.freeContext();
+    }
+  });
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -591,37 +838,41 @@ export async function transcribeAudio(
 
   const modelDir = resolveModelDir();
 
-  const segments: Segment[] = [];
+  const segments: Segment[] = await withHeavyOp(async () => {
+    const segs: Segment[] = [];
 
-  try {
-    await using demuxer = await Demuxer.open(abs);
+    try {
+      await using demuxer = await Demuxer.open(abs);
 
-    const audioStream = demuxer.audio();
-    if (!audioStream) {
-      throw new MediaError("NO_AUDIO_STREAM", `No audio stream found in: ${abs}`);
-    }
+      const audioStream = demuxer.audio();
+      if (!audioStream) {
+        throw new MediaError("NO_AUDIO_STREAM", `No audio stream found in: ${abs}`);
+      }
 
-    using decoder = await Decoder.create(audioStream);
-    using transcriber = await WhisperTranscriber.create({
-      model: modelName,
-      modelDir,
-      language: "auto",
-    });
-
-    for await (const seg of transcriber.transcribe(
-      decoder.frames(demuxer.packets(audioStream.index)),
-    )) {
-      segments.push({
-        start: seg.start,
-        end: seg.end,
-        text: seg.text,
-        ...(seg.turn !== undefined && { turn: seg.turn }),
+      using decoder = await Decoder.create(audioStream);
+      using transcriber = await WhisperTranscriber.create({
+        model: modelName,
+        modelDir,
+        language: "auto",
       });
+
+      for await (const seg of transcriber.transcribe(
+        decoder.frames(demuxer.packets(audioStream.index)),
+      )) {
+        segs.push({
+          start: seg.start,
+          end: seg.end,
+          text: seg.text,
+          ...(seg.turn !== undefined && { turn: seg.turn }),
+        });
+      }
+    } catch (err) {
+      if (err instanceof MediaError) throw err;
+      throw new MediaError("TRANSCRIBE_FAILED", `Transcription failed: ${abs}`, err);
     }
-  } catch (err) {
-    if (err instanceof MediaError) throw err;
-    throw new MediaError("TRANSCRIBE_FAILED", `Transcription failed: ${abs}`, err);
-  }
+
+    return segs;
+  });
 
   transcriptCache.set(cacheKey, segments);
   return segments;
@@ -676,11 +927,14 @@ export async function extractFrameGridImages(
   try {
     const grids: VideoGridImage[] = [];
     for (const plan of plans) {
-      const frames = await mapWithLimit(
-        plan.timestampsSec,
-        FRAME_EXTRACTION_CONCURRENCY,
-        (timestampSec) => buildVideoFrameImage(abs, timestampSec, abs),
-      );
+      // Batch-extract all frames for this grid in a single Demuxer session.
+      const batchResults = await extractFramesBatch(abs, plan.timestampsSec, abs);
+
+      const frames: VideoFrameImage[] = batchResults.map((r) => ({
+        image: r.buffer,
+        timestampSec: r.timestampSec,
+        timestampLabel: formatTimestamp(r.timestampSec),
+      }));
 
       if (frames.length === 0) continue;
 
@@ -794,7 +1048,8 @@ async function composeGrid(
 
 /**
  * Extract a single video frame at the given timestamp (seconds).
- * Returns a compressed JPEG Buffer.
+ * Returns a compressed JPEG Buffer with timestamp overlay.
+ * Delegates to extractFramesBatch() for the actual work.
  */
 export async function extractFrame(
   filePath: string,
@@ -814,38 +1069,12 @@ export async function extractFrame(
       throw new MediaError("NO_VIDEO_STREAM", `No video stream found in: ${abs}`);
     }
 
-    const safeTimestamp = Math.min(timestampSec, Math.max(0, info.duration - 0.2));
-    const ffmpeg = ffmpegPath();
-    const args = [
-      "-i",
-      abs,
-      "-ss",
-      String(safeTimestamp),
-      "-vframes",
-      "1",
-      "-f",
-      "image2pipe",
-      "-vcodec",
-      "mjpeg",
-      "pipe:1",
-    ];
-
-    const { stdout } = await execFile(ffmpeg, args, {
-      encoding: "buffer",
-      maxBuffer: 32 * 1024 * 1024,
-    });
-
-    if (!stdout || stdout.length === 0) {
-      throw new MediaError(
-        "FRAME_FAILED",
-        `No frame data returned at ${safeTimestamp}s in: ${abs}`,
-      );
+    const batch = await extractFramesBatch(abs, [timestampSec], overlayPrefix);
+    const result = batch[0];
+    if (!result) {
+      throw new MediaError("FRAME_FAILED", `No frame data returned at ${timestampSec}s in: ${abs}`);
     }
-
-    const compressed = await compressForLLM(stdout as unknown as Buffer);
-    const overlayLabel =
-      `${overlayPrefix ? `${overlayPrefix.split("/").at(-1) ?? overlayPrefix} ` : ""}${formatTimestamp(safeTimestamp)}`.trim();
-    return addTimestampOverlay(compressed, overlayLabel);
+    return result.buffer;
   } catch (err) {
     if (err instanceof MediaError) throw err;
     throw new MediaError(

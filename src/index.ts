@@ -10,6 +10,7 @@ export {
   extractFrame,
   extractFrameGridImages,
   extractFrameImage,
+  extractFrameImages,
   extractFrameGrid,
   probeMedia,
   resolveModelDir,

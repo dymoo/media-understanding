@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import {
   compressForLLM,
   extractFrameGridImages,
-  extractFrameImage,
+  extractFrameImages,
   probeMedia,
   transcribeAudio,
   truncateTranscript,
@@ -906,8 +906,10 @@ export async function handleGetFrames(
     const maxTotalChars = getTotalCharBudget(args.max_total_chars);
     const content: McpContentItem[] = [];
 
-    for (const ts of args.timestamps) {
-      const frame = await extractFrameImage(args.file_path, ts);
+    // Batch-extract all frames in a single Demuxer session.
+    const frames = await extractFrameImages(args.file_path, args.timestamps);
+
+    for (const frame of frames) {
       const labelItem: McpContentItem = { type: "text", text: formatFrameLabel(frame) };
       const imageItem: McpContentItem = {
         type: "image",
