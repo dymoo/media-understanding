@@ -13,6 +13,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import {
+  handleFetchYoutube,
   handleGetFrames,
   handleGetTranscript,
   handleGetVideoGrids,
@@ -38,14 +39,16 @@ Use this FIRST to scan a directory or batch of files, then pick individual files
 for heavy analysis with understand_media, get_transcript, or get_video_grids.
 
 Accepts a single \`paths\` parameter: a string or array of strings. Each string
-can be a literal file path or a glob pattern. Default limit is 50 files
-(absolute max 200).
+can be a literal file path, a glob pattern, or a URL (YouTube and other
+yt-dlp-supported platforms). URLs are automatically downloaded and cached in a
+temp directory — first call may take 10-60s, subsequent calls are instant.
 
 Examples:
   { "paths": "/path/to/video.mp4" }
   { "paths": ["/path/to/a.mp4", "/path/to/b.mp3"] }
   { "paths": "media/**/*.{mp4,mp3,wav}" }
-  { "paths": ["recordings/*.mp4", "specific/file.mp3"], "max_files": 100 }`,
+  { "paths": ["recordings/*.mp4", "specific/file.mp3"], "max_files": 100 }
+  { "paths": "https://youtube.com/watch?v=dQw4w9WgXcQ" }`,
     inputSchema: z.object({
       paths: z
         .union([z.string(), z.array(z.string()).min(1)])
@@ -76,6 +79,11 @@ Returns:
 - Keyframe grid images for video (JPEG base64, max 6 grids)
 - Image data for image files
 
+Accepts file paths and URLs. YouTube and other yt-dlp-supported platform URLs
+(e.g. https://youtube.com/watch?v=...) are automatically downloaded at lowest
+quality (for speed) and cached. First call for a URL may take 10-60s; subsequent
+calls are instant.
+
 Use this as your first call for any media file. For long videos (>10 min) or
 when you only need one modality, prefer the focused tools instead.
 
@@ -101,7 +109,8 @@ Examples:
   { "file_path": "/path/to/video.mp4" }
   { "file_path": "/path/to/podcast.mp3", "model": "base.en" }
   { "file_path": "/path/to/clip.mp4", "start_sec": 60, "end_sec": 120, "max_grids": 3 }
-  { "file_path": "/path/to/screen-recording.mp4", "sampling_strategy": "scene", "thumb_width": 320 }`,
+  { "file_path": "/path/to/screen-recording.mp4", "sampling_strategy": "scene", "thumb_width": 320 }
+  { "file_path": "https://youtube.com/watch?v=dQw4w9WgXcQ" }`,
     inputSchema: z.object({
       file_path: z.string().describe("Absolute or relative path to a single media file."),
       model: z
@@ -192,11 +201,14 @@ Examples:
 server.registerTool(
   "get_video_grids",
   {
-    description: `Extract keyframe grid images from a video file.
+    description: `Extract keyframe grid images from a video file or URL.
 
 Each grid is a JPEG contact sheet of thumbnails arranged in a cols×rows tile.
 Every tile has an exact timestamp overlay, and the accompanying text lists the
 exact timestamps in row-major order.
+
+Accepts file paths and URLs. YouTube and other yt-dlp-supported platform URLs
+are automatically downloaded at lowest quality and cached.
 
 Use this for visual inspection without transcription. It is budget-aware: if
 you omit max_grids, the server returns as many grids as fit under max_total_chars.
@@ -218,7 +230,8 @@ Examples:
   { "file_path": "/path/to/video.mp4" }
   { "file_path": "/path/to/movie.mkv", "start_sec": 300, "end_sec": 600, "max_grids": 2, "seconds_per_frame": 8 }
   { "file_path": "/path/to/screen-recording.mp4", "sampling_strategy": "scene", "thumb_width": 320 }
-  { "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }`,
+  { "file_path": "/path/to/lecture.mp4", "sampling_strategy": "scene", "frame_interval": 150 }
+  { "file_path": "https://youtube.com/watch?v=dQw4w9WgXcQ" }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to a video file."),
       max_total_chars: z
@@ -318,12 +331,16 @@ server.registerTool(
 Returns one JPEG image per requested timestamp. Useful for inspecting exact
 moments identified from a transcript or grid (e.g. "show me the frame at 1:23").
 
+Accepts file paths and URLs. YouTube and other yt-dlp-supported platform URLs
+are automatically downloaded at lowest quality and cached.
+
 Timestamps are in seconds (fractional values allowed).
 Each returned frame image includes an exact timestamp overlay.
 
 Examples:
   { "file_path": "/path/to/video.mp4", "timestamps": [0, 30, 60] }
-  { "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }`,
+  { "file_path": "/path/to/clip.mp4", "timestamps": [83.5] }
+  { "file_path": "https://youtube.com/watch?v=dQw4w9WgXcQ", "timestamps": [10, 30] }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to a video file."),
       max_total_chars: z
@@ -349,9 +366,14 @@ server.registerTool(
   {
     description: `Transcribe an audio or video file and return the text.
 
-Uses OpenAI's Whisper (via whisper.cpp). The model auto-downloads on first use
-(~57 MB for base.en-q5_1). Transcript is cached per file for the process lifetime.
-English-only models (*.en) already emit non-speech tokens (e.g. [Music], (applause)).
+Accepts file paths and URLs. For YouTube and other yt-dlp-supported platform URLs,
+subtitles are fetched first (instant, any language — LLMs understand all languages).
+If no subtitles are available, falls back to downloading audio and transcribing with
+Whisper. This makes it the fastest way to understand YouTube video content.
+
+For local files, uses OpenAI's Whisper (via whisper.cpp). The model auto-downloads
+on first use (~57 MB for base.en-q5_1). Transcript is cached per file for the
+process lifetime. English-only models (*.en) emit non-speech tokens (e.g. [Music]).
 For non-English audio, use multilingual variants: base-q5_1, small-q5_1, etc.
 
 Three output formats:
@@ -370,7 +392,8 @@ Examples:
   { "file_path": "/path/to/podcast.mp3" }
   { "file_path": "/path/to/meeting.mp4", "format": "srt" }
   { "file_path": "/path/to/episode.mp3", "format": "json", "start_sec": 60, "end_sec": 120 }
-  { "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }`,
+  { "file_path": "/path/to/meeting.mp4", "model": "base.en-q5_1", "max_chars": 16000 }
+  { "file_path": "https://youtube.com/watch?v=dQw4w9WgXcQ" }`,
     inputSchema: z.object({
       file_path: z.string().describe("Path to an audio or video file."),
       model: z
@@ -408,6 +431,70 @@ Examples:
     }),
   },
   handleGetTranscript,
+);
+
+server.registerTool(
+  "fetch_youtube",
+  {
+    description: `Fetch content from YouTube or any yt-dlp-supported platform.
+
+Returns file paths to downloaded content in a temp directory, plus video metadata.
+Subtitles are fetched and inlined by default (fastest way to understand a video).
+Downloaded files are cached — repeated calls for the same URL are instant.
+
+Use this tool when you want fine-grained control over what to download. For simpler
+workflows, you can also pass URLs directly to probe_media, understand_media,
+get_transcript, get_video_grids, or get_frames — they accept URLs transparently.
+
+**Default behavior (subtitles only):** ~1-5 seconds. Fetches available subtitles
+(manual or auto-generated, any language) and returns the transcript inline.
+If no subtitles exist, suggests using get_transcript for Whisper fallback.
+
+**Optional downloads:**
+- include_thumbnail: download video thumbnail image
+- include_video: download lowest quality video for frame analysis with
+  get_video_grids or get_frames (~10-60s depending on duration)
+- include_audio: download audio track for Whisper transcription with get_transcript
+
+All files persist in temp directory across calls, so you can fetch subtitles first,
+then request video later if frame analysis is needed — without re-downloading.
+
+Examples:
+  { "url": "https://youtube.com/watch?v=dQw4w9WgXcQ" }
+  { "url": "https://youtube.com/watch?v=dQw4w9WgXcQ", "include_thumbnail": true }
+  { "url": "https://youtube.com/watch?v=dQw4w9WgXcQ", "include_video": true }
+  { "url": "https://vimeo.com/123456", "include_audio": true, "include_video": true }`,
+    inputSchema: z.object({
+      url: z
+        .string()
+        .describe(
+          "URL of the video to fetch (YouTube, Vimeo, or any yt-dlp-supported platform).",
+        ),
+      include_subtitles: z
+        .boolean()
+        .optional()
+        .describe(
+          "Download and inline subtitles/captions (default true). Grabs first available language — LLMs understand any language.",
+        ),
+      include_video: z
+        .boolean()
+        .optional()
+        .describe(
+          "Download lowest quality video for frame analysis with get_video_grids / get_frames (default false). Slower but enables visual analysis.",
+        ),
+      include_audio: z
+        .boolean()
+        .optional()
+        .describe(
+          "Download audio for Whisper transcription via get_transcript (default false). Use when no subtitles are available.",
+        ),
+      include_thumbnail: z
+        .boolean()
+        .optional()
+        .describe("Download video thumbnail image (default false)."),
+    }),
+  },
+  handleFetchYoutube,
 );
 
 const transport = new StdioServerTransport();

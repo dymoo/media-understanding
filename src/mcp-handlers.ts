@@ -46,6 +46,7 @@ import {
   preflightFileSize,
 } from "./mcp-preflight.js";
 import type {
+  FetchYoutubeArgs,
   GetFramesArgs,
   GetTranscriptArgs,
   GetVideoGridsArgs,
@@ -58,6 +59,17 @@ import type {
 import { mcpError } from "./mcp-types.js";
 import type { Segment, VideoGridImage } from "./types.js";
 import { MediaError } from "./types.js";
+import {
+  downloadAudio,
+  downloadSubtitles,
+  downloadThumbnail,
+  downloadVideo,
+  getVideoInfo,
+  isUrl,
+  parseSubtitlesToSegments,
+  resolveUrlToAudioPath,
+  resolveUrlToLocalPath,
+} from "./youtube.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports for backward compatibility
@@ -65,6 +77,7 @@ import { MediaError } from "./types.js";
 
 export type { McpContentItem, McpErrorResult, McpSuccessResult } from "./mcp-types.js";
 export type {
+  FetchYoutubeArgs,
   GetFramesArgs,
   GetTranscriptArgs,
   GetVideoGridsArgs,
@@ -175,7 +188,12 @@ export async function handleProbeMedia(
   args: ProbeMediaArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
-    const paths = await expandPaths(args.paths);
+    // Resolve any URLs to local cached files before path expansion
+    const rawPaths = Array.isArray(args.paths) ? args.paths : [args.paths];
+    const resolvedInputs = await Promise.all(
+      rawPaths.map((p) => (isUrl(p.trim()) ? resolveUrlToLocalPath(p.trim()) : Promise.resolve(p))),
+    );
+    const paths = await expandPaths(resolvedInputs);
 
     const requestedMax = args.max_files ?? DEFAULT_PROBE_MAX_FILES;
     const maxFiles = Math.min(requestedMax, ABSOLUTE_MAX_PROBE_FILES);
@@ -225,14 +243,18 @@ export async function handleUnderstandMedia(
   args: UnderstandMediaArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
-    const info = await probeMedia(args.file_path);
+    // Resolve URL to local cached file if needed
+    const filePath = isUrl(args.file_path)
+      ? await resolveUrlToLocalPath(args.file_path)
+      : args.file_path;
+    const info = await probeMedia(filePath);
     preflightFileSize(info, "understand_media");
     preflightDuration(info, PREFLIGHT_MAX_DURATION_FULL, "understand_media");
 
     const maxTotalChars = getTotalCharBudget(args.max_total_chars);
 
     const result = await understandMedia(
-      args.file_path,
+      filePath,
       buildOpts({
         model: args.model,
         maxChars: args.max_chars,
@@ -249,7 +271,7 @@ export async function handleUnderstandMedia(
       }),
     );
 
-    const content = await buildUnderstandMediaContent(result, args.file_path, maxTotalChars);
+    const content = await buildUnderstandMediaContent(result, filePath, maxTotalChars);
 
     content.push({ type: "text", text: summarizePayload(content) });
     assertFitsBudget(
@@ -432,11 +454,15 @@ export async function handleGetVideoGrids(
   args: GetVideoGridsArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
-    const info = await probeMedia(args.file_path);
+    // Resolve URL to local cached file if needed
+    const filePath = isUrl(args.file_path)
+      ? await resolveUrlToLocalPath(args.file_path)
+      : args.file_path;
+    const info = await probeMedia(filePath);
     preflightFileSize(info, "get_video_grids");
 
     const grids = await extractFrameGridImages(
-      args.file_path,
+      filePath,
       buildOpts({
         maxGrids: args.max_grids,
         startSec: args.start_sec,
@@ -524,14 +550,18 @@ export async function handleGetFrames(
   args: GetFramesArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
-    const info = await probeMedia(args.file_path);
+    // Resolve URL to local cached file if needed
+    const filePath = isUrl(args.file_path)
+      ? await resolveUrlToLocalPath(args.file_path)
+      : args.file_path;
+    const info = await probeMedia(filePath);
     preflightFileSize(info, "get_frames");
 
     const maxTotalChars = getTotalCharBudget(args.max_total_chars);
     const content: McpContentItem[] = [];
 
     // Batch-extract all frames in a single Demuxer session.
-    const frames = await extractFrameImages(args.file_path, args.timestamps);
+    const frames = await extractFrameImages(filePath, args.timestamps);
 
     for (const frame of frames) {
       const labelItem: McpContentItem = { type: "text", text: formatFrameLabel(frame) };
@@ -574,14 +604,30 @@ export async function handleGetTranscript(
   args: GetTranscriptArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
-    const info = await probeMedia(args.file_path);
-    preflightFileSize(info, "get_transcript");
-    preflightDuration(info, PREFLIGHT_MAX_DURATION_TRANSCRIPT, "get_transcript");
-
     const maxChars =
       args.max_chars ?? parseInt(process.env["MEDIA_UNDERSTANDING_MAX_CHARS"] ?? "32000", 10);
 
-    const allSegments = await transcribeAudio(args.file_path, buildOpts({ model: args.model }));
+    let allSegments: Segment[];
+
+    if (isUrl(args.file_path)) {
+      // Fast path: try yt-dlp subtitles first (no video download needed)
+      const subsPath = await downloadSubtitles(args.file_path);
+      if (subsPath) {
+        allSegments = parseSubtitlesToSegments(subsPath);
+      } else {
+        // Slow path: no subtitles available — download audio and Whisper it
+        const audioPath = await resolveUrlToAudioPath(args.file_path);
+        const info = await probeMedia(audioPath);
+        preflightFileSize(info, "get_transcript");
+        preflightDuration(info, PREFLIGHT_MAX_DURATION_TRANSCRIPT, "get_transcript");
+        allSegments = await transcribeAudio(audioPath, buildOpts({ model: args.model }));
+      }
+    } else {
+      const info = await probeMedia(args.file_path);
+      preflightFileSize(info, "get_transcript");
+      preflightDuration(info, PREFLIGHT_MAX_DURATION_TRANSCRIPT, "get_transcript");
+      allSegments = await transcribeAudio(args.file_path, buildOpts({ model: args.model }));
+    }
 
     // Apply time-window filter (if specified)
     const segments = filterSegmentsByWindow(allSegments, args.start_sec, args.end_sec);
@@ -613,6 +659,86 @@ export async function handleGetTranscript(
     return {
       content: [{ type: "text", text }],
     };
+  } catch (err) {
+    return mcpError(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// fetch_youtube handler
+// ---------------------------------------------------------------------------
+
+export async function handleFetchYoutube(
+  args: FetchYoutubeArgs,
+): Promise<McpSuccessResult | McpErrorResult> {
+  try {
+    const includeSubtitles = args.include_subtitles !== false; // default true
+    const includeVideo = args.include_video === true;
+    const includeAudio = args.include_audio === true;
+    const includeThumbnail = args.include_thumbnail === true;
+
+    // Always fetch info first
+    const info = await getVideoInfo(args.url);
+
+    const lines: string[] = [
+      `Title: ${info.title}`,
+      `Duration: ${info.duration}s`,
+      `Uploader: ${info.uploader}`,
+      `URL: ${info.url}`,
+      "",
+    ];
+
+    // Subtitles (default: on)
+    let subtitleSegments: Segment[] | null = null;
+    if (includeSubtitles) {
+      const subsPath = await downloadSubtitles(args.url);
+      if (subsPath) {
+        subtitleSegments = parseSubtitlesToSegments(subsPath);
+        lines.push(`Subtitles: ${subsPath}`);
+        lines.push(`Subtitle languages available: ${info.subtitleLanguages.join(", ") || "auto-generated"}`);
+      } else {
+        lines.push(
+          "Subtitles: none available — use get_transcript on the audio/video path below for Whisper transcription fallback.",
+        );
+      }
+    }
+
+    // Thumbnail
+    if (includeThumbnail) {
+      const thumbPath = await downloadThumbnail(args.url);
+      lines.push(`Thumbnail: ${thumbPath}`);
+    }
+
+    // Video (lowest quality for frame analysis)
+    if (includeVideo) {
+      const videoPath = await downloadVideo(args.url);
+      lines.push(`Video: ${videoPath}`);
+    }
+
+    // Audio
+    if (includeAudio) {
+      const audioPath = await downloadAudio(args.url);
+      lines.push(`Audio: ${audioPath}`);
+    }
+
+    lines.push("");
+    lines.push(
+      "Use these paths with probe_media, understand_media, get_video_grids, get_frames, or get_transcript for further analysis.",
+    );
+
+    const content: McpContentItem[] = [{ type: "text", text: lines.join("\n") }];
+
+    // Inline subtitle transcript text when available (saves an extra tool call)
+    if (subtitleSegments && subtitleSegments.length > 0) {
+      const maxChars = parseInt(process.env["MEDIA_UNDERSTANDING_MAX_CHARS"] ?? "32000", 10);
+      const transcriptText = formatTranscriptSegments(subtitleSegments, maxChars);
+      content.push({
+        type: "text",
+        text: `\n--- TRANSCRIPT (from subtitles) ---\n${transcriptText}`,
+      });
+    }
+
+    return { content };
   } catch (err) {
     return mcpError(err);
   }

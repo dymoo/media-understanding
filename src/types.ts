@@ -184,6 +184,8 @@ export type MediaErrorCode =
   | "INVALID_SAMPLING"
   | "BUDGET_EXCEEDED"
   | "FILE_TOO_LARGE"
+  | "YT_DLP_NOT_FOUND"
+  | "YT_DLP_FAILED"
   | "UNKNOWN";
 
 /** Structured error thrown by media processing functions. */
