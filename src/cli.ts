@@ -91,7 +91,8 @@ try {
   if (info.fileSizeBytes !== undefined) parts.push(formatSize(info.fileSizeBytes));
 
   process.stdout.write(
-    `${parts.join(" ")}
+    `File: ${info.path}
+${parts.join(" ")}
 
 This file has been detected by the media-understanding CLI.
 Use your media-understanding MCP tools for full analysis:

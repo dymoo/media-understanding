@@ -1,6 +1,6 @@
 {
   "name": "@dymoo/media-understanding",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "MCP server that converts audio/video/image to text + images for LLM consumption",
   "type": "module",
   "license": "MIT",
