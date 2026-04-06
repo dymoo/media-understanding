@@ -1,24 +1,28 @@
 /**
  * YouTube / yt-dlp integration layer.
  *
- * Uses ytdlp-nodejs as a wrapper around a **system-installed** yt-dlp binary.
- * Downloads are cached in a temp directory keyed by URL hash so repeated calls
- * are instant.  Subtitle files are parsed into Segment[] for compatibility with
- * the existing transcript pipeline.
+ * Calls a **system-installed** yt-dlp binary directly via child_process.
+ * We intentionally do NOT bundle or download yt-dlp (copyright concerns).
+ * If yt-dlp is not on $PATH, all URL features are gracefully unavailable.
+ *
+ * Downloads are cached in a temp directory keyed by URL hash so repeated
+ * calls are instant. Subtitle files are parsed into Segment[] for
+ * compatibility with the existing transcript pipeline.
  */
 
+import { execFile as execFileCb, execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { execSync } from "node:child_process";
-import { YtDlp } from "ytdlp-nodejs";
-import type { VideoInfo, VideoThumbnail, DownloadResult } from "ytdlp-nodejs";
+import { promisify } from "node:util";
 
 import { ffmpegPath } from "node-av/ffmpeg";
 
 import type { Segment } from "./types.js";
 import { MediaError } from "./types.js";
+
+const execFile = promisify(execFileCb);
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -40,8 +44,9 @@ export function isUrl(input: string): boolean {
 // ---------------------------------------------------------------------------
 
 let resolvedBinaryPath: string | undefined;
+let ytDlpChecked = false;
 
-/** Locate the system yt-dlp binary.  Throws YT_DLP_NOT_FOUND on failure. */
+/** Locate the system yt-dlp binary. Throws YT_DLP_NOT_FOUND on failure. */
 export function ensureYtDlp(): string {
   if (resolvedBinaryPath) return resolvedBinaryPath;
 
@@ -49,43 +54,70 @@ export function ensureYtDlp(): string {
     const result = execSync("which yt-dlp", { encoding: "utf8" }).trim();
     if (result) {
       resolvedBinaryPath = result;
+      ytDlpChecked = true;
       return result;
     }
   } catch {
     // fall through
   }
 
+  ytDlpChecked = true;
   throw new MediaError(
     "YT_DLP_NOT_FOUND",
     "yt-dlp is not installed on this system. Install it (https://github.com/yt-dlp/yt-dlp#installation) and ensure it is on $PATH.",
   );
 }
 
-// ---------------------------------------------------------------------------
-// Singleton YtDlp instance (lazy)
-// ---------------------------------------------------------------------------
-
-let instance: YtDlp | undefined;
-
-function getYtDlp(): YtDlp {
-  if (instance) return instance;
-
-  const binaryPath = ensureYtDlp();
-
-  // Try to hand the node-av bundled ffmpeg to yt-dlp so it can mux formats.
-  let ffmpeg: string | undefined;
+/**
+ * Synchronous check whether yt-dlp is available on the system.
+ * Result is cached at module level after first call.
+ */
+export function hasYtDlp(): boolean {
+  if (ytDlpChecked) return resolvedBinaryPath !== undefined;
   try {
-    ffmpeg = ffmpegPath();
+    ensureYtDlp();
+    return true;
   } catch {
-    // node-av ffmpeg not available — yt-dlp will use system ffmpeg or skip muxing
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// yt-dlp invocation helpers
+// ---------------------------------------------------------------------------
+
+/** Common args prepended to every yt-dlp call. */
+function baseArgs(): string[] {
+  const args: string[] = ["--no-check-certificates"];
+
+  // Hand node-av's bundled ffmpeg to yt-dlp for muxing
+  try {
+    args.push("--ffmpeg-location", ffmpegPath());
+  } catch {
+    // node-av ffmpeg not available — yt-dlp will use system ffmpeg
   }
 
-  instance = new YtDlp({
-    binaryPath,
-    ...(ffmpeg ? { ffmpegPath: ffmpeg } : {}),
-  });
+  return args;
+}
 
-  return instance;
+/**
+ * Run yt-dlp with the given arguments. Returns { stdout, stderr }.
+ * Throws MediaError on non-zero exit.
+ */
+async function runYtDlp(
+  args: string[],
+  context: string,
+): Promise<{ stdout: string; stderr: string }> {
+  const bin = ensureYtDlp();
+  try {
+    return await execFile(bin, [...baseArgs(), ...args], {
+      maxBuffer: 50 * 1024 * 1024, // 50 MB — --dump-json can be large
+      timeout: 5 * 60 * 1000, // 5 min
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new MediaError("YT_DLP_FAILED", `${context}: ${msg}`, err);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +135,7 @@ function cacheDir(url: string): string {
 }
 
 /**
- * Find any file in the cache dir matching a glob-like prefix.
+ * Find any file in the cache dir matching a prefix + extension set.
  * yt-dlp names files unpredictably, so we scan the directory.
  */
 function findFileInDir(dir: string, prefix: string, extensions?: string[]): string | null {
@@ -143,30 +175,42 @@ export interface YtDlpVideoInfo {
 }
 
 export async function getVideoInfo(url: string): Promise<YtDlpVideoInfo> {
-  const ytdlp = getYtDlp();
-  try {
-    const info = (await ytdlp.getInfoAsync(url)) as VideoInfo;
-    const subtitles = await ytdlp.getSubtitles(url).catch(() => [] as { language: string }[]);
-    return {
-      id: info.id,
-      title: info.title,
-      duration: info.duration ?? 0,
-      description: info.description ?? "",
-      uploader: info.uploader ?? "",
-      viewCount: info.view_count ?? 0,
-      uploadDate: info.upload_date ?? "",
-      thumbnailUrl: info.thumbnail ?? "",
-      hasSubtitles: subtitles.length > 0,
-      subtitleLanguages: subtitles.map((s) => s.language),
-      url,
-    };
-  } catch (err) {
-    throw new MediaError(
-      "YT_DLP_FAILED",
-      `Failed to fetch video info for ${url}: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
+  const { stdout } = await runYtDlp(
+    ["--dump-json", "--no-download", url],
+    `Failed to fetch video info for ${url}`,
+  );
+
+  const info = JSON.parse(stdout) as Record<string, unknown>;
+
+  /** Safely coerce an unknown value to string. */
+  const str = (v: unknown): string =>
+    typeof v === "string" ? v : v == null ? "" : JSON.stringify(v);
+  const num = (v: unknown): number => (typeof v === "number" ? v : Number(v) || 0);
+
+  // Extract subtitle languages from the subtitles/automatic_captions objects
+  const subtitleLangs = new Set<string>();
+  for (const key of ["subtitles", "automatic_captions"] as const) {
+    const obj = info[key];
+    if (obj && typeof obj === "object") {
+      for (const lang of Object.keys(obj as Record<string, unknown>)) {
+        subtitleLangs.add(lang);
+      }
+    }
   }
+
+  return {
+    id: str(info["id"]),
+    title: str(info["title"]),
+    duration: num(info["duration"]),
+    description: str(info["description"]),
+    uploader: str(info["uploader"]) || str(info["channel"]),
+    viewCount: num(info["view_count"]),
+    uploadDate: str(info["upload_date"]),
+    thumbnailUrl: str(info["thumbnail"]),
+    hasSubtitles: subtitleLangs.size > 0,
+    subtitleLanguages: [...subtitleLangs],
+    url,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +218,7 @@ export async function getVideoInfo(url: string): Promise<YtDlpVideoInfo> {
 // ---------------------------------------------------------------------------
 
 /**
- * Download subtitles for a URL.  Tries manual captions first, then auto-generated.
+ * Download subtitles for a URL. Tries manual captions first, then auto-generated.
  * Returns the path to the downloaded subtitle file, or null if none available.
  */
 export async function downloadSubtitles(url: string): Promise<string | null> {
@@ -184,23 +228,26 @@ export async function downloadSubtitles(url: string): Promise<string | null> {
   const cached = findFileInDir(dir, "subs", [".srt", ".vtt", ".ass", ".json3"]);
   if (cached) return cached;
 
-  const ytdlp = getYtDlp();
-
   try {
-    // Use execAsync with subtitle flags — the fluent builder doesn't expose all subtitle options easily
-    await ytdlp.execAsync(url, {
-      writeSubs: true,
-      writeAutoSubs: true,
-      subLangs: ["all"],
-      subFormat: "srt/vtt/best",
-      skipDownload: true,
-      output: join(dir, "subs.%(ext)s"),
-    });
+    await runYtDlp(
+      [
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-lang",
+        "all",
+        "--sub-format",
+        "srt/vtt/best",
+        "--skip-download",
+        "-o",
+        join(dir, "subs.%(ext)s"),
+        url,
+      ],
+      `Subtitle download for ${url}`,
+    );
   } catch {
-    // yt-dlp may exit non-zero when no subs exist
+    // yt-dlp may exit non-zero when no subs exist — that's fine
   }
 
-  // Find whatever subtitle file was written
   return findFileInDir(dir, "subs", [".srt", ".vtt", ".ass", ".json3"]);
 }
 
@@ -221,12 +268,10 @@ export function parseSubtitlesToSegments(subtitlePath: string): Segment[] {
 
 function parseSrt(content: string): Segment[] {
   const segments: Segment[] = [];
-  // SRT blocks are separated by blank lines
   const blocks = content.split(/\n\s*\n/).filter((b) => b.trim());
 
   for (const block of blocks) {
     const lines = block.trim().split("\n");
-    // Find the timestamp line (contains -->)
     const tsLineIdx = lines.findIndex((l) => l.includes("-->"));
     if (tsLineIdx < 0) continue;
 
@@ -241,7 +286,7 @@ function parseSrt(content: string): Segment[] {
     const text = lines
       .slice(tsLineIdx + 1)
       .join(" ")
-      .replace(/<[^>]*>/g, "") // strip HTML tags
+      .replace(/<[^>]*>/g, "")
       .trim();
 
     if (text) segments.push({ start, end, text });
@@ -251,8 +296,6 @@ function parseSrt(content: string): Segment[] {
 }
 
 function parseVtt(content: string): Segment[] {
-  // VTT is similar to SRT but with WEBVTT header and slightly different format
-  // Strip the WEBVTT header and any style blocks
   const stripped = content
     .replace(/^WEBVTT.*?\n\n/s, "")
     .replace(/^STYLE\n[\s\S]*?\n\n/gm, "")
@@ -269,31 +312,17 @@ function timestampToMs(h: string, m: string, s: string, ms: string): number {
 // Public API — Thumbnail download
 // ---------------------------------------------------------------------------
 
-/**
- * Download the video thumbnail. Returns the local file path.
- */
+/** Download the video thumbnail. Returns the local file path. */
 export async function downloadThumbnail(url: string): Promise<string> {
   const dir = cacheDir(url);
 
-  // Check cache
   const cached = findFileInDir(dir, "thumb", [".jpg", ".png", ".webp"]);
   if (cached) return cached;
 
-  const ytdlp = getYtDlp();
-
-  try {
-    await ytdlp.execAsync(url, {
-      writeThumbnail: true,
-      skipDownload: true,
-      output: join(dir, "thumb.%(ext)s"),
-    });
-  } catch (err) {
-    throw new MediaError(
-      "YT_DLP_FAILED",
-      `Failed to download thumbnail for ${url}: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
-  }
+  await runYtDlp(
+    ["--write-thumbnail", "--skip-download", "-o", join(dir, "thumb.%(ext)s"), url],
+    `Failed to download thumbnail for ${url}`,
+  );
 
   const result = findFileInDir(dir, "thumb", [".jpg", ".png", ".webp"]);
   if (!result) {
@@ -306,44 +335,17 @@ export async function downloadThumbnail(url: string): Promise<string> {
 // Public API — Video download (lowest quality for frame analysis)
 // ---------------------------------------------------------------------------
 
-/**
- * Download the video at lowest quality (for frame analysis speed).
- * Returns the local file path.
- */
+/** Download video at lowest quality (for frame analysis speed). Returns local path. */
 export async function downloadVideo(url: string): Promise<string> {
   const dir = cacheDir(url);
 
-  // Check cache
   const cached = findFileInDir(dir, "video", [".mp4", ".webm", ".mkv"]);
   if (cached) return cached;
 
-  const ytdlp = getYtDlp();
-
-  try {
-    const result: DownloadResult = await ytdlp.downloadAsync(url, {
-      format: { filter: "mergevideo", quality: "lowest" } as never,
-      output: join(dir, "video.%(ext)s"),
-    });
-
-    const filePath = result.filePaths?.[0];
-    if (filePath && existsSync(filePath)) return filePath;
-  } catch {
-    // Fallback: try with worst format string directly
-  }
-
-  // Fallback: use execAsync with explicit worst format
-  try {
-    await ytdlp.execAsync(url, {
-      format: "worst[ext=mp4]/worst",
-      output: join(dir, "video.%(ext)s"),
-    });
-  } catch (err) {
-    throw new MediaError(
-      "YT_DLP_FAILED",
-      `Failed to download video for ${url}: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
-  }
+  await runYtDlp(
+    ["-f", "worst[ext=mp4]/worst", "-o", join(dir, "video.%(ext)s"), url],
+    `Failed to download video for ${url}`,
+  );
 
   const result = findFileInDir(dir, "video", [".mp4", ".webm", ".mkv"]);
   if (!result) {
@@ -353,44 +355,20 @@ export async function downloadVideo(url: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Public API — Audio download (for Whisper fallback)
+// Public API — Audio download (for ASR fallback)
 // ---------------------------------------------------------------------------
 
-/**
- * Download audio only.  Returns the local file path.
- */
+/** Download audio only. Returns the local file path. */
 export async function downloadAudio(url: string): Promise<string> {
   const dir = cacheDir(url);
 
-  // Check cache
   const cached = findFileInDir(dir, "audio", [".m4a", ".mp3", ".wav", ".opus", ".ogg"]);
   if (cached) return cached;
 
-  const ytdlp = getYtDlp();
-
-  try {
-    const result: DownloadResult = await ytdlp.downloadAudio(url, "m4a");
-
-    const filePath = result.filePaths?.[0];
-    if (filePath && existsSync(filePath)) return filePath;
-  } catch {
-    // fallback below
-  }
-
-  // Fallback with explicit options
-  try {
-    await ytdlp.execAsync(url, {
-      extractAudio: true,
-      audioFormat: "m4a",
-      output: join(dir, "audio.%(ext)s"),
-    });
-  } catch (err) {
-    throw new MediaError(
-      "YT_DLP_FAILED",
-      `Failed to download audio for ${url}: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
-  }
+  await runYtDlp(
+    ["-x", "--audio-format", "m4a", "-o", join(dir, "audio.%(ext)s"), url],
+    `Failed to download audio for ${url}`,
+  );
 
   const result = findFileInDir(dir, "audio", [".m4a", ".mp3", ".wav", ".opus", ".ogg"]);
   if (!result) {
@@ -400,16 +378,14 @@ export async function downloadAudio(url: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Public API — Resolve URL to local video path (for transparent integration)
+// Public API — Resolve URL to local path (transparent integration)
 // ---------------------------------------------------------------------------
 
-// In-memory map to avoid repeated fs.stat on cache hits within the same process.
 const resolvedPaths = new Map<string, string>();
 
 /**
  * Resolve a URL to a local file path, downloading if necessary.
- * Downloads lowest quality video+audio for versatility (frame analysis + Whisper).
- * Cached across calls.
+ * Downloads lowest quality video+audio for versatility.
  */
 export async function resolveUrlToLocalPath(url: string): Promise<string> {
   const cached = resolvedPaths.get(url);
@@ -428,35 +404,6 @@ export async function resolveUrlToAudioPath(url: string): Promise<string> {
   try {
     return await downloadAudio(url);
   } catch {
-    // If audio extraction fails, fall back to full video
     return await resolveUrlToLocalPath(url);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Public API — Available subtitles listing
-// ---------------------------------------------------------------------------
-
-export async function listSubtitles(
-  url: string,
-): Promise<{ language: string; languages: string[]; ext: string; autoCaption: boolean }[]> {
-  const ytdlp = getYtDlp();
-  try {
-    return await ytdlp.getSubtitles(url);
-  } catch {
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Public API — Get thumbnails info
-// ---------------------------------------------------------------------------
-
-export async function getThumbnails(url: string): Promise<VideoThumbnail[]> {
-  const ytdlp = getYtDlp();
-  try {
-    return await ytdlp.getThumbnailsAsync(url);
-  } catch {
-    return [];
   }
 }

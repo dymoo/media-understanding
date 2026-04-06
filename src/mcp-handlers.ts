@@ -46,7 +46,7 @@ import {
   preflightFileSize,
 } from "./mcp-preflight.js";
 import type {
-  FetchYoutubeArgs,
+  FetchYtdlpArgs,
   GetFramesArgs,
   GetTranscriptArgs,
   GetVideoGridsArgs,
@@ -77,7 +77,7 @@ import {
 
 export type { McpContentItem, McpErrorResult, McpSuccessResult } from "./mcp-types.js";
 export type {
-  FetchYoutubeArgs,
+  FetchYtdlpArgs,
   GetFramesArgs,
   GetTranscriptArgs,
   GetVideoGridsArgs,
@@ -665,11 +665,11 @@ export async function handleGetTranscript(
 }
 
 // ---------------------------------------------------------------------------
-// fetch_youtube handler
+// fetch_ytdlp handler
 // ---------------------------------------------------------------------------
 
-export async function handleFetchYoutube(
-  args: FetchYoutubeArgs,
+export async function handleFetchYtdlp(
+  args: FetchYtdlpArgs,
 ): Promise<McpSuccessResult | McpErrorResult> {
   try {
     const includeSubtitles = args.include_subtitles !== false; // default true
@@ -695,7 +695,9 @@ export async function handleFetchYoutube(
       if (subsPath) {
         subtitleSegments = parseSubtitlesToSegments(subsPath);
         lines.push(`Subtitles: ${subsPath}`);
-        lines.push(`Subtitle languages available: ${info.subtitleLanguages.join(", ") || "auto-generated"}`);
+        lines.push(
+          `Subtitle languages available: ${info.subtitleLanguages.join(", ") || "auto-generated"}`,
+        );
       } else {
         lines.push(
           "Subtitles: none available — use get_transcript on the audio/video path below for Whisper transcription fallback.",

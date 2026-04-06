@@ -55,7 +55,6 @@
     "file-type": "^21.3.1",
     "node-av": "^5.2.2",
     "sharp": "^0.34.5",
-    "ytdlp-nodejs": "^3.4.4",
     "zod": "^3.24.0"
   },
   "optionalDependencies": {

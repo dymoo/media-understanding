@@ -79,7 +79,7 @@ export type ProbeMediaArgs = {
   max_files?: number | undefined;
 };
 
-export type FetchYoutubeArgs = {
+export type FetchYtdlpArgs = {
   url: string;
   include_video?: boolean | undefined;
   include_audio?: boolean | undefined;
