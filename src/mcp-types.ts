@@ -79,6 +79,14 @@ export type ProbeMediaArgs = {
   max_files?: number | undefined;
 };
 
+export type FetchYtdlpArgs = {
+  url: string;
+  include_video?: boolean | undefined;
+  include_audio?: boolean | undefined;
+  include_thumbnail?: boolean | undefined;
+  include_subtitles?: boolean | undefined;
+};
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------

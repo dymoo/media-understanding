@@ -173,11 +173,33 @@ Requirements:
 
 - Node >= 22
 - FFmpeg is handled automatically via `node-av`
-- The default Whisper model (`base.en-q5_1`, ~57 MB) downloads on first use; set `SKIP_MODEL_DOWNLOAD=1` to defer
+- The Parakeet TDT ASR model (~670 MB) auto-downloads on first transcription; set `SKIP_MODEL_DOWNLOAD=1` to defer
+
+### Optional: URL support via yt-dlp
+
+If [yt-dlp](https://github.com/yt-dlp/yt-dlp) is installed on your system, **all tools** gain the ability to accept URLs in place of file paths. A dedicated `fetch_ytdlp` tool is also registered for fine-grained download control.
+
+yt-dlp is **not bundled or downloaded** by this package — you must install it yourself. This is intentional (copyright/licensing reasons).
+
+```bash
+# macOS
+brew install yt-dlp
+
+# Linux
+pip install yt-dlp     # or: sudo apt install yt-dlp
+
+# Windows
+winget install yt-dlp   # or: pip install yt-dlp
+```
+
+**Supported platforms** (1800+ total):
+YouTube, Vimeo, **Loom**, Twitch, Dailymotion, TikTok, X/Twitter, Facebook, LinkedIn, Reddit, SoundCloud, Dropbox, Google Drive, BBC, CNN, and [many more](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
+
+When yt-dlp is detected at startup, the server logs `yt-dlp detected — URL support enabled` to stderr. Without it, tools only accept local file paths.
 
 ## How It Works
 
-The server exposes five tools organized around a three-step workflow: **discover, analyze, iterate**.
+The server exposes 5 core tools (+ 1 optional) organized around a three-step workflow: **discover, analyze, iterate**. When yt-dlp is installed, all tools also accept URLs.
 
 ```
 Step 1: DISCOVER (cheap, batch-safe)
@@ -192,6 +214,9 @@ Step 2: ANALYZE (expensive, one file at a time)
 Step 3: ITERATE (use output from one tool to target another)
   transcript timestamps → get_video_grids with start_sec/end_sec
   grid timestamps → get_frames with exact seconds
+
+Optional (requires yt-dlp):
+  fetch_ytdlp    →  download + cache media from URLs with fine-grained control
 ```
 
 The cost boundary between cheap and expensive operations is encoded in the tool names. `probe_media` is safe to call on dozens of files. The analysis tools process one file per call and enforce payload budgets so an LLM does not accidentally blow up its context.
@@ -273,6 +298,18 @@ One JPEG per requested timestamp. Each frame includes a timestamp overlay.
 **Example output** — single frame at t=60s:
 
 ![Example frame from get_frames — single frame extracted at 00:01:00.000 with filename and timestamp overlay](docs/assets/example-frame.jpg)
+
+### `fetch_ytdlp` — URL download control (requires yt-dlp)
+
+Only available when yt-dlp is installed. Fine-grained control over what to download from a URL: subtitles (default, instant), video (for frame analysis), audio (for ASR), thumbnail. All downloads are cached.
+
+For most workflows, passing a URL directly to `get_transcript` or `understand_media` is simpler — use `fetch_ytdlp` when you need selective downloads.
+
+```json
+{ "url": "https://youtube.com/watch?v=dQw4w9WgXcQ" }
+{ "url": "https://www.loom.com/share/abc123", "include_video": true }
+{ "url": "https://vimeo.com/123456", "include_audio": true }
+```
 
 ## Recommended LLM Workflow
 
@@ -381,19 +418,17 @@ const result = await understandMedia("/path/to/video.mp4");
 
 ## Environment Variables
 
-| Variable                        | Default        | Description                    |
-| ------------------------------- | -------------- | ------------------------------ |
-| `MEDIA_UNDERSTANDING_MODEL`     | `base.en-q5_1` | Whisper model name             |
-| `MEDIA_UNDERSTANDING_MAX_CHARS` | `32000`        | Max transcript characters      |
-| `MEDIA_UNDERSTANDING_MAX_GRIDS` | `6`            | Max grid images per video call |
+| Variable                         | Default | Description                                |
+| -------------------------------- | ------- | ------------------------------------------ |
+| `MEDIA_UNDERSTANDING_MAX_CHARS`  | `32000` | Max transcript characters                  |
+| `MEDIA_UNDERSTANDING_MAX_GRIDS`  | `6`     | Max grid images per video call             |
+| `MEDIA_UNDERSTANDING_DISABLE_HW` | (unset) | Set to `1` to force software decode/encode |
 
-## Whisper Models
+## ASR Model
 
-Default: `base.en-q5_1` (~57 MB, quantized). Models are cached at `~/.cache/media-understanding/models`.
+Uses NVIDIA Parakeet TDT 0.6B v3 (INT8 quantized ONNX, ~670 MB total). Supports 25 languages. Auto-downloads from HuggingFace on first transcription call.
 
-Standard: `tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`, `medium.en`, `large-v1`, `large-v2`, `large-v3`
-
-Quantized: `tiny.en-q5_1`, `base.en-q5_1`, `small.en-q5_1`, `large-v3-turbo-q5_0`
+Models are cached at `~/.cache/media-understanding/models/parakeet-tdt-0.6b-v3-int8/`.
 
 ## Credits
 
