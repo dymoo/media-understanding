@@ -193,7 +193,7 @@ winget install yt-dlp   # or: pip install yt-dlp
 ```
 
 **Supported platforms** (1800+ total):
-YouTube, Vimeo, **Loom**, Twitch, Dailymotion, TikTok, X/Twitter, Facebook, LinkedIn, Reddit, SoundCloud, Dropbox, Google Drive, BBC, CNN, and [many more](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
+YouTube, **Instagram** (Reels & posts), Vimeo, **Loom**, Twitch, Dailymotion, TikTok, X/Twitter, Facebook, LinkedIn, Reddit, SoundCloud, Dropbox, Google Drive, BBC, CNN, and [many more](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
 
 When yt-dlp is detected at startup, the server logs `yt-dlp detected — URL support enabled` to stderr. Without it, tools only accept local file paths.
 
@@ -307,6 +307,7 @@ For most workflows, passing a URL directly to `get_transcript` or `understand_me
 
 ```json
 { "url": "https://youtube.com/watch?v=dQw4w9WgXcQ" }
+{ "url": "https://www.instagram.com/reel/ABC123/", "include_audio": true }
 { "url": "https://www.loom.com/share/abc123", "include_video": true }
 { "url": "https://vimeo.com/123456", "include_audio": true }
 ```

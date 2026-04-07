@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import { ffmpegPath } from "node-av/ffmpeg";
+import { parse as parseSubtitles } from "@plussub/srt-vtt-parser";
 
 import type { Segment } from "./types.js";
 import { MediaError } from "./types.js";
@@ -124,7 +125,7 @@ async function runYtDlp(
 // Cache helpers
 // ---------------------------------------------------------------------------
 
-function urlHash(url: string): string {
+export function urlHash(url: string): string {
   return createHash("sha256").update(url.trim()).digest("hex").slice(0, 16);
 }
 
@@ -254,58 +255,38 @@ export async function downloadSubtitles(url: string): Promise<string | null> {
 /**
  * Parse an SRT or VTT subtitle file into our Segment[] format so it plugs
  * directly into the existing transcript pipeline.
+ *
+ * Uses @plussub/srt-vtt-parser for robust SRT/VTT handling (STYLE/NOTE
+ * block stripping, timestamp parsing, multiline cues). HTML tags are
+ * stripped post-parse and newlines are joined with spaces.
  */
 export function parseSubtitlesToSegments(subtitlePath: string): Segment[] {
   const content = readFileSync(subtitlePath, "utf8");
   const ext = subtitlePath.slice(subtitlePath.lastIndexOf(".")).toLowerCase();
 
-  if (ext === ".srt") return parseSrt(content);
-  if (ext === ".vtt") return parseVtt(content);
-
-  // For other formats, return the full text as a single segment
-  return [{ start: 0, end: 0, text: content }];
-}
-
-function parseSrt(content: string): Segment[] {
-  const segments: Segment[] = [];
-  const blocks = content.split(/\n\s*\n/).filter((b) => b.trim());
-
-  for (const block of blocks) {
-    const lines = block.trim().split("\n");
-    const tsLineIdx = lines.findIndex((l) => l.includes("-->"));
-    if (tsLineIdx < 0) continue;
-
-    const tsLine = lines[tsLineIdx]!;
-    const match = tsLine.match(
-      /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/,
-    );
-    if (!match) continue;
-
-    const start = timestampToMs(match[1]!, match[2]!, match[3]!, match[4]!);
-    const end = timestampToMs(match[5]!, match[6]!, match[7]!, match[8]!);
-    const text = lines
-      .slice(tsLineIdx + 1)
-      .join(" ")
-      .replace(/<[^>]*>/g, "")
-      .trim();
-
-    if (text) segments.push({ start, end, text });
+  // For formats the library doesn't handle, return full text as single segment
+  if (ext !== ".srt" && ext !== ".vtt") {
+    return [{ start: 0, end: 0, text: content }];
   }
 
+  // Normalize SRT period-separator timestamps to commas: some tools (including
+  // certain yt-dlp outputs) write "00:00:01.000 --> 00:00:03.500" instead of
+  // the standard "00:00:01,000 --> 00:00:03,500". The library expects commas.
+  const normalized =
+    ext === ".srt" ? content.replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, "$1,$2") : content;
+
+  const parsed = parseSubtitles(normalized) as {
+    entries: Array<{ from: number; to: number; text: string }>;
+  };
+  const segments: Segment[] = [];
+  for (const entry of parsed.entries) {
+    const text = entry.text
+      .replace(/<[^>]*>/g, "")
+      .replace(/\n/g, " ")
+      .trim();
+    if (text) segments.push({ start: entry.from, end: entry.to, text });
+  }
   return segments;
-}
-
-function parseVtt(content: string): Segment[] {
-  const stripped = content
-    .replace(/^WEBVTT.*?\n\n/s, "")
-    .replace(/^STYLE\n[\s\S]*?\n\n/gm, "")
-    .replace(/^NOTE\n[\s\S]*?\n\n/gm, "");
-
-  return parseSrt(stripped);
-}
-
-function timestampToMs(h: string, m: string, s: string, ms: string): number {
-  return parseInt(h) * 3600000 + parseInt(m) * 60000 + parseInt(s) * 1000 + parseInt(ms);
 }
 
 // ---------------------------------------------------------------------------

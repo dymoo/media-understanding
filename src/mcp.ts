@@ -44,9 +44,9 @@ if (ytDlpAvailable) {
 // ---------------------------------------------------------------------------
 
 const URL_PLATFORMS =
-  "YouTube, Vimeo, Loom, Twitch, Dailymotion, TikTok, X/Twitter, Facebook, " +
-  "LinkedIn, Reddit, SoundCloud, Dropbox, Google Drive, BBC, CNN, and 1800+ " +
-  "other sites supported by yt-dlp";
+  "YouTube, Instagram (Reels & posts), Vimeo, Loom, Twitch, Dailymotion, TikTok, " +
+  "X/Twitter, Facebook, LinkedIn, Reddit, SoundCloud, Dropbox, Google Drive, BBC, " +
+  "CNN, and 1800+ other sites supported by yt-dlp";
 
 const URL_BLURB = `
 
@@ -434,7 +434,7 @@ Examples:
 
 const server = new McpServer({
   name: "media-understanding",
-  version: "0.1.0",
+  version: "1.0.0",
 });
 
 // ---------------------------------------------------------------------------

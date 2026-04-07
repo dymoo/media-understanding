@@ -1,6 +1,7 @@
 dist/
 node_modules/
 coverage/
+tmp/
 docs/assets/*.png
 docs/assets/*.jpg
 docs/assets/*.jpeg
