@@ -88,3 +88,39 @@ jobs:
           npm init -y
           SKIP_MODEL_DOWNLOAD=1 npm install --foreground-scripts "./$TARBALL"
           node --input-type=module -e "await import('@dymoo/media-understanding'); console.log('ok');"
+
+  docker-http-smoke:
+    name: Docker HTTP smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build Docker image
+        run: docker build -t media-understanding:ci .
+
+      - name: Start Docker container
+        run: |
+          docker run -d \
+            --name media-understanding-http \
+            -p 8000:8000 \
+            -v "$PWD/testdata:/media:ro" \
+            media-understanding:ci
+
+      - name: Run HTTP MCP smoke script
+        env:
+          MCP_SMOKE_MEDIA_PATH: /media/tiny.png
+        run: node scripts/smoke-http-mcp.mjs
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs media-understanding-http
+
+      - name: Stop Docker container
+        if: always()
+        run: docker rm -f media-understanding-http

@@ -78,7 +78,7 @@ Add to `~/.config/opencode/opencode.json`:
     "media-understanding": {
       "type": "local",
       "command": "npx",
-      "args": ["-y", "@dymoo/media-understanding/mcp"],
+      "args": ["-y", "-p", "@dymoo/media-understanding", "media-understanding-mcp"],
       "env": {
         "MEDIA_UNDERSTANDING_MODEL": "base.en-q5_1"
       }
@@ -99,7 +99,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "media-understanding": {
       "command": "npx",
-      "args": ["-y", "@dymoo/media-understanding/mcp"],
+      "args": ["-y", "-p", "@dymoo/media-understanding", "media-understanding-mcp"],
       "env": {
         "MEDIA_UNDERSTANDING_MODEL": "base.en-q5_1"
       }
@@ -120,7 +120,7 @@ Add to `.cursor/mcp.json` in your project or `~/.cursor/mcp.json` globally:
   "mcpServers": {
     "media-understanding": {
       "command": "npx",
-      "args": ["-y", "@dymoo/media-understanding/mcp"],
+      "args": ["-y", "-p", "@dymoo/media-understanding", "media-understanding-mcp"],
       "env": {
         "MEDIA_UNDERSTANDING_MODEL": "base.en-q5_1"
       }
@@ -141,7 +141,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
   "mcpServers": {
     "media-understanding": {
       "command": "npx",
-      "args": ["-y", "@dymoo/media-understanding/mcp"],
+      "args": ["-y", "-p", "@dymoo/media-understanding", "media-understanding-mcp"],
       "env": {
         "MEDIA_UNDERSTANDING_MODEL": "base.en-q5_1"
       }
@@ -158,7 +158,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 Add a new MCP server:
 
 - command: `npx`
-- args: `-y @dymoo/media-understanding/mcp`
+- args: `-y -p @dymoo/media-understanding media-understanding-mcp`
 - env: `MEDIA_UNDERSTANDING_MODEL=base.en-q5_1`
 
 </details>
@@ -173,13 +173,41 @@ Requirements:
 
 - Node >= 22
 - FFmpeg is handled automatically via `node-av`
-- The Parakeet TDT ASR model (~670 MB) auto-downloads on first transcription; set `SKIP_MODEL_DOWNLOAD=1` to defer
+- The default Whisper model (`base.en-q5_1`, ~57 MB) auto-downloads on first transcription; set `SKIP_MODEL_DOWNLOAD=1` to defer
+
+## Docker Quick Start
+
+The npm package runs the MCP server over **stdio**. The official Docker image wraps that same server with [`supergateway`](https://github.com/supercorp-ai/supergateway) so HTTP-capable MCP clients can connect directly.
+
+```bash
+docker run --rm -p 8000:8000 ghcr.io/dymoo/media-understanding:1.1.0
+```
+
+Endpoints:
+
+- MCP: `http://localhost:8000/mcp`
+- Health: `http://localhost:8000/healthz`
+
+The official Docker image includes:
+
+- the built `media-understanding-mcp` server
+- `supergateway@3.4.3` for Streamable HTTP transport
+- the default Whisper model (`base.en-q5_1`)
+- `yt-dlp`, so URL support is enabled out of the box
+
+Bind-mount media into the container when you want to analyze local files:
+
+```bash
+docker run --rm -p 8000:8000 -v "$PWD/testdata:/media:ro" ghcr.io/dymoo/media-understanding:1.1.0
+```
 
 ### Optional: URL support via yt-dlp
 
 If [yt-dlp](https://github.com/yt-dlp/yt-dlp) is installed on your system, **all tools** gain the ability to accept URLs in place of file paths. A dedicated `fetch_ytdlp` tool is also registered for fine-grained download control.
 
-yt-dlp is **not bundled or downloaded** by this package — you must install it yourself. This is intentional (copyright/licensing reasons).
+yt-dlp is **not bundled by the npm package** — you must install it yourself for local stdio usage. The official Docker image includes yt-dlp so URL support works out of the box.
+
+As always, URL support does not change your responsibility to comply with local law, content rights, and target-site terms.
 
 ```bash
 # macOS
@@ -393,7 +421,7 @@ The server is conservative by default:
   - `get_transcript`: files over 4 hours
   - All heavy tools: files over 10 GB
 - **Bounded transcript cache:** In-memory LRU cache (max 32 entries, skips transcripts over 500K chars). Prevents unbounded memory growth.
-- **Concurrency limits:** Frame extraction is capped at 4 concurrent FFmpeg processes to control memory peaks.
+- **Concurrency limits:** Heavy operations (transcription + frame extraction) are capped at 2 concurrent in-process jobs to control memory peaks.
 
 When the server rejects a request, it explains _why_ and suggests _what to do instead_ — it teaches the calling model to recover.
 
@@ -419,17 +447,18 @@ const result = await understandMedia("/path/to/video.mp4");
 
 ## Environment Variables
 
-| Variable                         | Default | Description                                |
-| -------------------------------- | ------- | ------------------------------------------ |
-| `MEDIA_UNDERSTANDING_MAX_CHARS`  | `32000` | Max transcript characters                  |
-| `MEDIA_UNDERSTANDING_MAX_GRIDS`  | `6`     | Max grid images per video call             |
-| `MEDIA_UNDERSTANDING_DISABLE_HW` | (unset) | Set to `1` to force software decode/encode |
+| Variable                         | Default        | Description                                |
+| -------------------------------- | -------------- | ------------------------------------------ |
+| `MEDIA_UNDERSTANDING_MODEL`      | `base.en-q5_1` | Default Whisper model name                 |
+| `MEDIA_UNDERSTANDING_MAX_CHARS`  | `32000`        | Max transcript characters                  |
+| `MEDIA_UNDERSTANDING_MAX_GRIDS`  | `6`            | Max grid images per video call             |
+| `MEDIA_UNDERSTANDING_DISABLE_HW` | (unset)        | Set to `1` to force software decode/encode |
 
 ## ASR Model
 
-Uses NVIDIA Parakeet TDT 0.6B v3 (INT8 quantized ONNX, ~670 MB total). Supports 25 languages. Auto-downloads from HuggingFace on first transcription call.
+Uses Whisper via `node-av`. Default model: `base.en-q5_1` (English, quantized GGML, ~57 MB). The default model is cached on first transcription call, or prewarmed during Docker image build.
 
-Models are cached at `~/.cache/media-understanding/models/parakeet-tdt-0.6b-v3-int8/`.
+Models are cached at `~/.cache/media-understanding/models/` (or `$XDG_CACHE_HOME/media-understanding/models/`).
 
 ## Credits
 

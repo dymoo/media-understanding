@@ -10,8 +10,8 @@
  * When yt-dlp is installed on the system, all tools additionally accept URLs
  * (YouTube, Vimeo, Loom, and 1800+ other platforms) and a dedicated
  * `fetch_ytdlp` tool is registered. Without yt-dlp, only local file paths
- * are accepted. yt-dlp is never downloaded or bundled — it must be
- * system-installed.
+ * are accepted. The npm package does not bundle yt-dlp; the official Docker
+ * image installs it for you.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -93,7 +93,7 @@ const understandSchema = z.object({
     .string()
     .optional()
     .describe(
-      "ASR model name. Default: Parakeet TDT 0.6B (auto-downloads ~670 MB on first use). Supports 25 languages.",
+      'Whisper model name. Default: "base.en-q5_1" (English, ~57 MB, cached on first use).',
     ),
   max_chars: z
     .number()
@@ -278,7 +278,7 @@ const transcriptSchema = z.object({
     .string()
     .optional()
     .describe(
-      "ASR model. Default: Parakeet TDT 0.6B. Supports 25 languages. Auto-downloads ~670 MB on first use.",
+      'Whisper model name. Default: "base.en-q5_1" (English, ~57 MB, cached on first use).',
     ),
   max_chars: z
     .number()
@@ -334,7 +334,7 @@ const UNDERSTAND_DESC_BASE = `Fully analyze a media file (audio, video, or image
 
 Returns:
 - Metadata (type, duration, resolution, codecs)
-- Transcript text for audio/video (Parakeet TDT ASR, auto-downloaded on first use)
+- Transcript text for audio/video (Whisper via node-av, default model auto-downloaded on first use)
 - Keyframe grid images for video (JPEG base64, max 6 grids)
 - Image data for image files
 
@@ -407,8 +407,8 @@ Examples:
 
 const TRANSCRIPT_DESC_BASE = `Transcribe an audio or video file and return the text.
 
-Uses NVIDIA Parakeet TDT 0.6B (ONNX, auto-downloads ~670 MB on first use).
-Supports 25 languages. Transcript is cached per file for the process lifetime.
+Uses Whisper via node-av. Default model: "base.en-q5_1" (English, ~57 MB,
+cached on first use). Transcript is cached per file for the process lifetime.
 
 Three output formats:
 - "text" (default): timestamped lines — "[start–end] text" per segment
@@ -434,7 +434,7 @@ Examples:
 
 const server = new McpServer({
   name: "media-understanding",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 // ---------------------------------------------------------------------------

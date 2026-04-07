@@ -1,0 +1,12 @@
+.git
+.github
+.opencode
+dist
+node_modules
+tmp
+coverage
+.nyc_output
+.env*
+docs/assets
+testdata
+*.tgz
