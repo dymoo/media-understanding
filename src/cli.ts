@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * CLI stub — lightweight probe-only output for OpenClaw media model integration.
+ * CLI stub — type-aware media output for OpenClaw media model integration.
  *
- * Runs probeMedia() (~5-50ms, header read only) and outputs metadata plus
- * guidance to use the MCP tools for full analysis. No transcription, no grid
- * extraction, no heavy work.
+ * Audio files:  runs transcription inline and outputs the full transcript.
+ * Video files:  outputs metadata + directive MCP tool guidance.
+ * Image files:  outputs metadata + "ready for direct analysis" message.
  *
  * Usage:
  *   media-understanding <file>
@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { probeMedia } from "./media.js";
+import { probeMedia, transcribeAudio, truncateTranscript } from "./media.js";
 import { MediaError } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -45,8 +45,10 @@ if (values.help || positionals.length === 0) {
   process.stdout.write(
     `Usage: media-understanding <file>
 
-Runs a quick metadata probe (~50ms) and outputs file info plus MCP tool guidance.
-For full analysis (transcription, keyframe grids, etc.), use the MCP server tools.
+Probes a media file and outputs type-aware results:
+  Audio: runs transcription and prints the full transcript.
+  Video: outputs metadata and MCP tool guidance.
+  Image: outputs metadata; ready for direct vision model analysis.
 
 Options:
   -h, --help     Show this help
@@ -90,19 +92,60 @@ try {
   else if (info.audioCodec) parts.push(info.audioCodec);
   if (info.fileSizeBytes !== undefined) parts.push(formatSize(info.fileSizeBytes));
 
-  process.stdout.write(
-    `File: ${info.path}
-${parts.join(" ")}
+  const header = `File: ${info.path}\n${parts.join(" ")}\n`;
 
-This file has been detected by the media-understanding CLI.
-Use your media-understanding MCP tools for full analysis:
-  - probe_media: batch metadata scanning
-  - understand_media: full analysis (transcript + keyframe grids)
-  - get_transcript: speech content with format options (text/srt/json)
-  - get_video_grids: visual keyframe inspection
-  - get_frames: exact frame extraction at specific timestamps
+  if (info.type === "audio") {
+    // ── Audio: run transcription inline ──
+    process.stdout.write(header + "\n");
+
+    const maxChars = parseInt(process.env["MEDIA_UNDERSTANDING_MAX_CHARS"] ?? "32000", 10);
+    const segments = await transcribeAudio(info.path);
+    const fullText = segments.map((s) => s.text.trim()).join(" ");
+    const transcript = truncateTranscript(fullText, maxChars);
+
+    process.stdout.write(`--- Transcript ---\n${transcript}\n--- End Transcript ---\n`);
+
+    if (segments.length > 0) {
+      process.stdout.write(
+        `\nFor more options (SRT timestamps, JSON segments, time windowing), use MCP tools:
+  - get_transcript(file_path: "${info.path}", format: "srt")
+  - understand_media(file_path: "${info.path}")
 `,
-  );
+      );
+    }
+  } else if (info.type === "video") {
+    // ── Video: directive MCP guidance ──
+    process.stdout.write(
+      `${header}
+IMPORTANT: This video must be analyzed for both visual and audio content.
+Run understand_media with the file path above for a complete analysis.
+
+Available MCP tools for this file:
+  - understand_media(file_path: "${info.path}") — transcript + keyframe grids
+  - get_transcript(file_path: "${info.path}") — speech transcription only
+  - get_video_grids(file_path: "${info.path}") — visual keyframe grids
+  - get_frames(file_path: "${info.path}", timestamps: [...]) — exact frames
+  - probe_media(paths: "${info.path}") — lightweight metadata only
+`,
+    );
+  } else if (info.type === "image") {
+    // ── Image: ready for direct analysis ──
+    process.stdout.write(
+      `${header}
+This image is ready for direct analysis — no MCP tools needed.
+Pass it to your vision model directly, or use probe_media for metadata.
+`,
+    );
+  } else {
+    // ── Unknown type: generic guidance ──
+    process.stdout.write(
+      `${header}
+Use your media-understanding MCP tools for analysis:
+  - probe_media(paths: "${info.path}")
+  - understand_media(file_path: "${info.path}")
+`,
+    );
+  }
 } catch (err) {
   const message =
     err instanceof MediaError

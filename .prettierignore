@@ -1,6 +1,7 @@
 dist/
 node_modules/
 coverage/
+pnpm-lock.yaml
 docs/assets/*.png
 docs/assets/*.jpg
 docs/assets/*.jpeg

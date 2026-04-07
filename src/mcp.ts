@@ -89,12 +89,6 @@ const understandSchema = z.object({
   file_path: z
     .string()
     .describe("Absolute or relative path to a single media file (or URL if yt-dlp is available)."),
-  model: z
-    .string()
-    .optional()
-    .describe(
-      "ASR model name. Default: Parakeet TDT 0.6B (auto-downloads ~670 MB on first use). Supports 25 languages.",
-    ),
   max_chars: z
     .number()
     .int()
@@ -274,12 +268,6 @@ const framesSchema = z.object({
 
 const transcriptSchema = z.object({
   file_path: z.string().describe("Path to an audio or video file (or URL if yt-dlp is available)."),
-  model: z
-    .string()
-    .optional()
-    .describe(
-      "ASR model. Default: Parakeet TDT 0.6B. Supports 25 languages. Auto-downloads ~670 MB on first use.",
-    ),
   max_chars: z
     .number()
     .int()

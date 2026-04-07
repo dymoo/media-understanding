@@ -7,7 +7,7 @@
  *   tiny.mp3  — same as wav, MP3-encoded
  *   tiny.mp4  — 5-second 320×240 test video with audio
  *
- * Transcription tests require a Whisper model (~75 MB download on first run).
+ * Transcription tests require the Parakeet ASR model (~670 MB download on first run).
  * They have a generous timeout and skip gracefully if SKIP_TRANSCRIPTION=1.
  */
 
@@ -26,10 +26,10 @@ import {
   extractFrameGridImages,
   extractFrameImage,
   probeMedia,
-  resolveModelDir,
   transcribeAudio,
   understandMedia,
 } from "../media.js";
+import { resolveModelDir } from "../model-manager.js";
 import { MediaError } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -321,17 +321,7 @@ describe("transcribeAudio", { timeout: 5 * 60 * 1000 }, () => {
     assert.equal(s1, s2);
   });
 
-  it("throws TRANSCRIBE_FAILED for invalid model name", async (t) => {
-    if (!existsSync(WAV)) return t.skip("tiny.wav not present");
-    await assert.rejects(
-      () => transcribeAudio(WAV, { model: "not-a-real-model-xyz" }),
-      (err: MediaError) => {
-        assert.ok(err instanceof MediaError);
-        assert.equal(err.code, "TRANSCRIBE_FAILED");
-        return true;
-      },
-    );
-  });
+  // Model validation test removed: Parakeet uses a single ONNX model (no user-selectable model names).
 });
 
 // ---------------------------------------------------------------------------
@@ -349,7 +339,7 @@ describe("understandMedia — image", () => {
 });
 
 // ---------------------------------------------------------------------------
-// understandMedia — video (slow path, requires Whisper model)
+// understandMedia — video (slow path, requires ASR model)
 // ---------------------------------------------------------------------------
 
 describe("understandMedia — video", { timeout: 5 * 60 * 1000 }, () => {

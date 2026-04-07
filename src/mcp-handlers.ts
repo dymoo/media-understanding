@@ -256,7 +256,6 @@ export async function handleUnderstandMedia(
     const result = await understandMedia(
       filePath,
       buildOpts({
-        model: args.model,
         maxChars: args.max_chars,
         maxGrids: args.max_grids,
         startSec: args.start_sec,
@@ -615,18 +614,18 @@ export async function handleGetTranscript(
       if (subsPath) {
         allSegments = parseSubtitlesToSegments(subsPath);
       } else {
-        // Slow path: no subtitles available — download audio and Whisper it
+        // Slow path: no subtitles available — download audio and transcribe
         const audioPath = await resolveUrlToAudioPath(args.file_path);
         const info = await probeMedia(audioPath);
         preflightFileSize(info, "get_transcript");
         preflightDuration(info, PREFLIGHT_MAX_DURATION_TRANSCRIPT, "get_transcript");
-        allSegments = await transcribeAudio(audioPath, buildOpts({ model: args.model }));
+        allSegments = await transcribeAudio(audioPath, {});
       }
     } else {
       const info = await probeMedia(args.file_path);
       preflightFileSize(info, "get_transcript");
       preflightDuration(info, PREFLIGHT_MAX_DURATION_TRANSCRIPT, "get_transcript");
-      allSegments = await transcribeAudio(args.file_path, buildOpts({ model: args.model }));
+      allSegments = await transcribeAudio(args.file_path, {});
     }
 
     // Apply time-window filter (if specified)

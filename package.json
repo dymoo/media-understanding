@@ -16,7 +16,8 @@
     "video",
     "audio",
     "transcription",
-    "whisper",
+    "parakeet",
+    "onnx",
     "ffmpeg",
     "opencode",
     "agents"
@@ -40,12 +41,16 @@
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
+    "bench:parakeet:cpu": "node scripts/benchmark-ep.mjs --json",
+    "bench:parakeet:mlx": "tmp/benchmarks/.venv/bin/python scripts/benchmark-parakeet-mlx.py",
+    "bench:whisper:cpp": "node scripts/benchmark-whisper-cpp.mjs",
+    "bench:asr:matrix": "node scripts/benchmark-asr-matrix.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
     "check-all": "pnpm run format:check && pnpm run lint && pnpm run typecheck",
-    "postinstall": "node scripts/install-node-av.mjs && node scripts/download-whisper-model.mjs",
+    "postinstall": "node scripts/install-node-av.mjs && node scripts/download-parakeet-model.mjs",
     "test": "node --test dist/tests/*.test.js",
     "pretest": "tsc",
     "prepublishOnly": "pnpm run check-all && pnpm run build"
@@ -54,6 +59,7 @@
     "@modelcontextprotocol/sdk": "^1.27.1",
     "file-type": "^21.3.1",
     "node-av": "^5.2.2",
+    "onnxruntime-node": "^1.24.3",
     "sharp": "^0.34.5",
     "zod": "^3.24.0"
   },

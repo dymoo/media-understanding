@@ -4,11 +4,10 @@
 
 import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import { fileTypeFromFile } from "file-type";
-import { Decoder, Demuxer, WhisperDownloader, WhisperTranscriber } from "node-av/api";
+import { Demuxer } from "node-av/api";
 import { AVSEEK_FLAG_BACKWARD } from "node-av/constants";
 import { isFfmpegAvailable } from "node-av/ffmpeg";
 import type { Frame } from "node-av/lib";
@@ -204,18 +203,8 @@ async function classifyFile(abs: string): Promise<"image" | "av" | "unknown"> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Return the directory where Whisper GGML models are cached. */
-export function resolveModelDir(): string {
-  const xdg = process.env["XDG_CACHE_HOME"];
-  if (xdg) return join(xdg, "media-understanding", "models");
-
-  if (process.platform === "win32") {
-    const localAppData = process.env["LOCALAPPDATA"];
-    if (localAppData) return join(localAppData, "media-understanding", "models");
-  }
-
-  return join(homedir(), ".cache", "media-understanding", "models");
-}
+// Model directory is now managed by model-manager.ts (Parakeet ONNX models).
+// Legacy resolveModelDir() removed — see model-manager.ts:resolveModelDir().
 
 /** Resize + JPEG-encode a buffer for LLM consumption (max 1280px wide, q=75). */
 export async function compressForLLM(input: Buffer, maxWidth = 1280): Promise<Buffer> {
@@ -797,67 +786,34 @@ export async function probeMedia(filePath: string): Promise<MediaInfo> {
 
 /**
  * Transcribe the audio track of a media file.
+ *
+ * Uses Parakeet TDT 0.6B v3 (ONNX) — model auto-downloads on first use (~670 MB).
  * Results are cached in-memory keyed by SHA-256 content fingerprint.
  */
 export async function transcribeAudio(
   filePath: string,
-  opts: TranscribeOptions = {},
+  _opts: TranscribeOptions = {},
 ): Promise<Segment[]> {
   assertFfmpeg();
   const { abs } = await assertFile(filePath);
-
-  const modelName = opts.model ?? process.env["MEDIA_UNDERSTANDING_MODEL"] ?? "base.en-q5_1";
-
-  if (!WhisperDownloader.isValidModel(modelName)) {
-    throw new MediaError(
-      "TRANSCRIBE_FAILED",
-      `Invalid Whisper model name: "${modelName}". ` +
-        `Valid models: tiny, tiny.en, base, base.en, small, small.en, ` +
-        `medium, medium.en, large-v1, large-v2, large-v3, ` +
-        `tiny.en-q5_1, base.en-q5_1, base-q5_1, small.en-q5_1, large-v3-turbo-q5_0, etc.`,
-    );
-  }
 
   const cacheKey = await fileFingerprint(abs);
   const cached = transcriptCache.get(cacheKey);
   if (cached) return cached;
 
-  const modelDir = resolveModelDir();
-
   const segments: Segment[] = await withHeavyOp(async () => {
-    const segs: Segment[] = [];
-
     try {
-      await using demuxer = await Demuxer.open(abs);
+      const { extractPcm } = await import("./asr-audio.js");
+      const { transcribeLongForm } = await import("./asr-chunking.js");
 
-      const audioStream = demuxer.audio();
-      if (!audioStream) {
-        throw new MediaError("NO_AUDIO_STREAM", `No audio stream found in: ${abs}`);
-      }
+      const pcm = await extractPcm(abs);
+      if (pcm.length === 0) return [];
 
-      using decoder = await Decoder.create(audioStream);
-      using transcriber = await WhisperTranscriber.create({
-        model: modelName,
-        modelDir,
-        language: "auto",
-      });
-
-      for await (const seg of transcriber.transcribe(
-        decoder.frames(demuxer.packets(audioStream.index)),
-      )) {
-        segs.push({
-          start: seg.start,
-          end: seg.end,
-          text: seg.text,
-          ...(seg.turn !== undefined && { turn: seg.turn }),
-        });
-      }
+      return await transcribeLongForm(pcm);
     } catch (err) {
       if (err instanceof MediaError) throw err;
       throw new MediaError("TRANSCRIBE_FAILED", `Transcription failed: ${abs}`, err);
     }
-
-    return segs;
   });
 
   transcriptCache.set(cacheKey, segments);

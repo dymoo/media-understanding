@@ -12,3 +12,4 @@ testdata/*.wav
 testdata/*.m4a
 package-lock.json
 .opencode/
+tmp/benchmarks/

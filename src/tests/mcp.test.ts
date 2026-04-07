@@ -291,11 +291,12 @@ describe("get_frames tool surface", () => {
 // ---------------------------------------------------------------------------
 
 describe("get_transcript tool surface — validation", () => {
-  it("transcribeAudio throws TRANSCRIBE_FAILED for invalid model name", async (t) => {
+  // Model validation test removed: Parakeet uses a single ONNX model (no user-selectable model names).
+  it("transcribeAudio throws for file with no audio stream", async (t) => {
     if (!existsSync(PNG)) return t.skip("tiny.png not present");
     const { transcribeAudio } = await import("../media.js");
     await assert.rejects(
-      () => transcribeAudio(PNG, { model: "definitely-not-a-valid-model-xyz" }),
+      () => transcribeAudio(PNG),
       (err: MediaError) => {
         assert.ok(err instanceof MediaError);
         assert.equal(err.code, "TRANSCRIBE_FAILED");
@@ -323,14 +324,12 @@ describe("get_transcript tool surface — validation", () => {
     );
   });
 
-  it("formats timestamped transcript text through the MCP handler", async (t) => {
+  it("rejects non-audio files through the MCP handler", async (t) => {
     if (!existsSync(PNG)) return t.skip("tiny.png not present");
     const result = await handleGetTranscript({
       file_path: PNG,
-      model: "definitely-not-a-valid-model-xyz",
     });
     assert.ok("isError" in result);
-    assert.match(result.content[0].text, /TRANSCRIBE_FAILED/);
   });
 });
 
@@ -957,7 +956,7 @@ describe("filterSegmentsByWindow", () => {
 // ---------------------------------------------------------------------------
 
 describe("get_transcript — format and windowing", () => {
-  // Note: tiny.wav is a sine wave with no speech, so Whisper returns empty segments.
+  // Note: tiny.wav is a sine wave with no speech, so the ASR model returns empty segments.
   // Integration tests for format+windowing with actual speech depend on media.test.ts
   // fixtures. Here we test the handler's behavior with the no-speech edge case and
   // verify that format/windowing params are accepted without error.

@@ -27,7 +27,6 @@ export type McpSuccessResult = {
 
 export type UnderstandMediaArgs = {
   file_path: string;
-  model?: string | undefined;
   max_chars?: number | undefined;
   max_total_chars?: number | undefined;
   max_grids?: number | undefined;
@@ -67,7 +66,6 @@ export type GetFramesArgs = {
 
 export type GetTranscriptArgs = {
   file_path: string;
-  model?: string | undefined;
   max_chars?: number | undefined;
   format?: "text" | "srt" | "json" | undefined;
   start_sec?: number | undefined;

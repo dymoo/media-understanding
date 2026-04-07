@@ -13,11 +13,12 @@ export {
   extractFrameImages,
   extractFrameGrid,
   probeMedia,
-  resolveModelDir,
   transcribeAudio,
   truncateTranscript,
   understandMedia,
 } from "./media.js";
+
+export { resolveModelDir } from "./model-manager.js";
 
 export {
   handleGetFrames,

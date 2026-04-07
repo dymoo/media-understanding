@@ -4,7 +4,7 @@
 
 import type { AccelInfo } from "./accel.js";
 
-/** A Whisper transcription segment with millisecond timestamps. */
+/** A transcription segment with millisecond timestamps. */
 export interface Segment {
   /** Start time in milliseconds. */
   start: number;
@@ -113,11 +113,6 @@ export interface GridOptions {
 
 /** Options controlling transcription. */
 export interface TranscribeOptions {
-  /**
-   * Whisper model name.
-   * @default "base.en-q5_1"
-   */
-  model?: string;
   /**
    * Maximum characters of transcript to return (truncates middle).
    * @default 32000
